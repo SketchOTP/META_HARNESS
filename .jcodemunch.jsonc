@@ -1,0 +1,5 @@
+// jcodemunch project overrides — trust this repo root so index_folder works on N:\… (fewer than 3 path parts).
+{
+  "version": "1.21.12",
+  "trusted_folders": ["."]
+}

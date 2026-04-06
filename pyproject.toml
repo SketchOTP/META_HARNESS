@@ -1,0 +1,51 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "meta-harness"
+version = "0.1.0"
+description = "A self-improving outer loop for any project — diagnoses its own behavior and rewrites its own code."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [
+  { name = "Ghost Animus LLC", email = "tym@ghostanimus.com" }
+]
+keywords = ["meta-learning", "self-improvement", "autonomous", "ai", "code-generation"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Developers",
+  "Programming Language :: Python :: 3",
+  "License :: OSI Approved :: MIT License",
+]
+dependencies = [
+  "click>=8.1.0",
+  "filelock>=3.0.0",
+  "httpx>=0.27.0",
+  "pypdf>=4.0.0",
+  "rich>=13.0.0",
+  "tomli-w>=1.0.0",
+  "gitpython>=3.1.0",
+  "watchdog>=3.0.0",
+  "python-dotenv>=1.0.0",
+  "tomli>=2.0.0; python_version < '3.11'",
+]
+
+[project.optional-dependencies]
+slack = ["slack-bolt>=1.18.0", "slack-sdk>=3.27.0"]
+dev = ["pytest>=7.0", "pytest-cov>=4.0"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[project.scripts]
+metaharness = "meta_harness.cli:main"
+
+# Flat layout: Python modules live at repo root but install as package `meta_harness`.
+[tool.setuptools]
+package-dir = { "meta_harness" = "." }
+packages = ["meta_harness"]
+
+[tool.setuptools.package-data]
+meta_harness = ["templates/*.toml", "templates/*.md"]

@@ -1,0 +1,4136 @@
+================================================================================
+FILE: cli.py
+================================================================================"""
+meta_harness/cli.py
+Click-based CLI: metaharness init | run | daemon | status
+"""
+from __future__ import annotations
+
+import json
+import re
+import shutil
+from pathlib import Path
+
+import click
+from rich.console import Console
+from rich.table import Table
+
+from .dashboard import DEFAULT_HOST as DASHBOARD_DEFAULT_HOST
+
+console = Console()
+
+
+def _find_project_root(start: Path) -> Path:
+    """Walk up until metaharness.toml is found, or use cwd."""
+    current = start
+    for _ in range(10):
+        if (current / "metaharness.toml").exists():
+            return current
+        parent = current.parent
+        if parent == current:
+            break
+        current = parent
+    return start  # Fall back to cwd
+
+
+def _discover_project_registry(start: Path):
+    """Load ``metaharness-projects.toml`` by walking up from ``start``; ``None`` if absent."""
+    from .multi_project import find_registry_file, load_project_registry
+
+    discovered = find_registry_file(start.resolve())
+    if discovered is None:
+        return None
+    return load_project_registry(discovered.parent, registry_file=discovered)
+
+
+@click.group()
+def main():
+    """Meta-Harness — self-improving outer loop for any project."""
+    pass
+
+
+# ── init ───────────────────────────────────────────────────────────────────────
+
+@main.command()
+@click.option("--dir", "target_dir", default=".", help="Project root directory")
+@click.option("--force", is_flag=True, help="Overwrite existing metaharness.toml")
+def init(target_dir: str, force: bool):
+    """Scaffold a metaharness.toml config in your project."""
+    root = Path(target_dir).resolve()
+    config_dest = root / "metaharness.toml"
+
+    if config_dest.exists() and not force:
+        console.print(
+            f"[yellow]metaharness.toml already exists at {config_dest}\n"
+            "Use --force to overwrite.[/yellow]"
+        )
+        return
+
+    template = Path(__file__).parent / "templates" / "metaharness.toml"
+    shutil.copy(template, config_dest)
+
+    # Also create .metaharness/ dirs and .gitignore entry
+    harness_dir = root / ".metaharness"
+    harness_dir.mkdir(exist_ok=True)
+    (harness_dir / "directives").mkdir(exist_ok=True)
+    (harness_dir / "cycles").mkdir(exist_ok=True)
+    (harness_dir / "cycles" / "maintenance").mkdir(exist_ok=True)
+    (harness_dir / "cycles" / "product").mkdir(exist_ok=True)
+
+    gitignore = root / ".gitignore"
+    entry = "\n# Meta-Harness runtime\n.metaharness/\n"
+    if gitignore.exists():
+        content = gitignore.read_text(encoding="utf-8")
+        if ".metaharness" not in content:
+            gitignore.write_text(content + entry)
+    else:
+        gitignore.write_text(entry.strip() + "\n")
+
+    console.print(f"[green]✓ Initialized Meta-Harness at {root}[/green]")
+    console.print(f"[dim]Edit [bold]metaharness.toml[/bold] to configure your project.[/dim]")
+    console.print(f"[dim]Then run [bold]metaharness run --once[/bold] to try a cycle.[/dim]")
+
+
+# ── run (single cycle) ─────────────────────────────────────────────────────────
+
+@main.command("run")
+@click.option("--once", is_flag=True, default=True, help="Run a single cycle (default)")
+@click.option("--dir", "target_dir", default=".", help="Project root directory")
+def run_cmd(once: bool, target_dir: str):
+    """Run a single Meta-Harness cycle."""
+    from .config import load_config
+    from .cycle import run_cycle
+
+    root = _find_project_root(Path(target_dir).resolve())
+    cfg = load_config(root)
+
+    if not (root / "metaharness.toml").exists():
+        console.print(
+            "[red]No metaharness.toml found. Run [bold]metaharness init[/bold] first.[/red]"
+        )
+        raise SystemExit(1)
+
+    outcome = run_cycle(cfg)
+    raise SystemExit(0 if outcome.status.value == "COMPLETED" else 1)
+
+
+# ── daemon ─────────────────────────────────────────────────────────────────────
+
+@main.command()
+@click.option("--dir", "target_dir", default=".", help="Project root directory")
+@click.option(
+    "--projects-file",
+    type=click.Path(path_type=Path),
+    default=None,
+    help="Explicit path to metaharness-projects.toml (multi-project daemon). "
+    "Default: walk up from --dir for metaharness-projects.toml.",
+)
+@click.option(
+    "--git-kg-sync",
+    is_flag=True,
+    default=False,
+    help="After each maintenance cycle, sync git commits into the KG (also: METAHARNESS_GIT_KG_SYNC=1).",
+)
+def daemon(target_dir: str, projects_file: Path | None, git_kg_sync: bool):
+    """Run the outer loop continuously at the configured interval."""
+    from .config import load_config
+    from .daemon import run_daemon, run_multi_project_daemon
+
+    start = Path(target_dir).resolve()
+
+    if projects_file is not None:
+        pf = projects_file.resolve()
+        if not pf.is_file():
+            console.print(f"[red]Projects file not found: {pf}[/red]")
+            raise SystemExit(1)
+        from .multi_project import load_project_registry
+
+        reg = load_project_registry(pf.parent, registry_file=pf)
+        if reg is None:
+            console.print(f"[red]Could not load registry: {pf}[/red]")
+            raise SystemExit(1)
+        run_multi_project_daemon(reg, git_kg_sync_after_cycle=git_kg_sync)
+        return
+
+    reg = _discover_project_registry(start)
+    if reg is not None:
+        run_multi_project_daemon(reg, git_kg_sync_after_cycle=git_kg_sync)
+        return
+
+    root = _find_project_root(start)
+    cfg = load_config(root)
+    run_daemon(cfg, git_kg_sync_after_cycle=git_kg_sync)
+
+
+# ── status ─────────────────────────────────────────────────────────────────────
+
+@main.command()
+@click.option("--dir", "target_dir", default=".", help="Project root directory")
+@click.option(
+    "--projects-file",
+    type=click.Path(path_type=Path),
+    default=None,
+    help="Explicit path to metaharness-projects.toml (show registry in status).",
+)
+@click.option("-n", default=10, help="Number of cycles to show")
+def status(target_dir: str, projects_file: Path | None, n: int):
+    """Show recent cycle history."""
+    from .config import load_config
+
+    start = Path(target_dir).resolve()
+
+    if projects_file is not None:
+        pf = projects_file.resolve()
+        if not pf.is_file():
+            console.print(f"[red]Projects file not found: {pf}[/red]")
+            raise SystemExit(1)
+        from .multi_project import load_project_registry
+
+        reg = load_project_registry(pf.parent, registry_file=pf)
+        if reg is None:
+            console.print(f"[red]Could not load registry: {pf}[/red]")
+            raise SystemExit(1)
+    else:
+        reg = _discover_project_registry(start)
+
+    if reg is not None:
+        console.print(f"[bold]Multi-project registry[/bold] {reg.registry_path}")
+        if reg.product_project_id:
+            console.print(f"[dim]product_project_id:[/dim] {reg.product_project_id}")
+        pt = Table(title="Registered projects", show_lines=True)
+        pt.add_column("id", style="cyan")
+        pt.add_column("enabled")
+        pt.add_column("label", style="dim")
+        pt.add_column("root")
+        for p in reg.projects:
+            pt.add_row(
+                p.id,
+                "yes" if p.enabled else "no",
+                p.label or "—",
+                str(p.root),
+            )
+        console.print(pt)
+        console.print()
+
+    root = _find_project_root(start)
+    cfg = load_config(root)
+
+    logs: list[Path] = []
+    for d in (cfg.maintenance_cycles_dir, cfg.cycles_dir):
+        if d.is_dir():
+            logs.extend(d.glob("*.json"))
+    logs = sorted(logs, key=lambda p: p.stat().st_mtime, reverse=True)[:n]
+
+    if not logs:
+        console.print("[dim]No cycles recorded yet.[/dim]")
+        return
+
+    table = Table(title=f"Meta-Harness — {cfg.project.name}", show_lines=True)
+    table.add_column("Timestamp", style="dim")
+    table.add_column("Directive")
+    table.add_column("Conf")
+    table.add_column("Status")
+    table.add_column("Changes")
+    table.add_column("Delta")
+
+    for log in reversed(logs):
+        try:
+            data = json.loads(log.read_text(encoding="utf-8"))
+            ts = data.get("timestamp", "?")[:19].replace("T", " ")
+            d_id = data.get("directive", "-")
+            title = data.get("directive_title", "")
+            status_val = data.get("status", "?")
+            changes = str(data.get("changes_applied", "-"))
+            delta = data.get("delta")
+
+            status_color = {
+                "COMPLETED": "green",
+                "VETOED": "yellow",
+                "TEST_FAILED": "red",
+                "AGENT_FAILED": "red",
+                "INSUFFICIENT_EVIDENCE": "dim",
+                "ERROR": "red",
+            }.get(status_val, "white")
+
+            delta_str = f"{delta:+.4f}" if delta is not None else "-"
+            directive_str = f"{d_id}\n[dim]{title[:50]}[/dim]" if title else d_id
+            dc = data.get("directive_confidence")
+            conf_str = ""
+            if dc is not None:
+                try:
+                    pct = int(round(float(dc) * 100))
+                    det = str(data.get("directive_confidence_detail") or "")
+                    m = re.search(r"\((high|medium|low)\)", det)
+                    tier = m.group(1) if m else ""
+                    conf_str = f"{pct}% ({tier})" if tier else f"{pct}%"
+                except (TypeError, ValueError):
+                    conf_str = "-"
+            else:
+                conf_str = "-"
+
+            table.add_row(
+                ts,
+                directive_str,
+                conf_str,
+                f"[{status_color}]{status_val}[/{status_color}]",
+                changes,
+                delta_str,
+            )
+        except Exception:
+            pass
+
+    console.print(table)
+
+    # Show pending directive if any
+    pending_dirs = list(cfg.directives_dir.glob("D*_auto.md")) + list(
+        cfg.directives_dir.glob("M*_auto.md")
+    )
+    if pending_dirs:
+        latest = sorted(pending_dirs, key=lambda p: p.stat().st_mtime)[-1]
+        console.print(f"\n[dim]Latest directive: {latest.name}[/dim]")
+
+
+@main.command()
+@click.option("--dir", "target_dir", default=".", help="Project root directory")
+@click.option("--id", "directive_id", required=True,
+              help="Directive ID (e.g. P003_auto, research_agent, my_fix)")
+@click.option("--title", required=True, help="Short human-readable title")
+@click.option("--status", "status_val", default="COMPLETED",
+              type=click.Choice(
+                  [
+                      "COMPLETED",
+                      "TEST_FAILED",
+                      "METRIC_REGRESSION",
+                      "AGENT_FAILED",
+                      "VETOED",
+                      "ERROR",
+                  ]
+              ),
+              help="Outcome status (default: COMPLETED)")
+@click.option("--layer", default="maintenance",
+              type=click.Choice(["maintenance", "product"]),
+              help="Which layer this belongs to (default: maintenance)")
+@click.option("--files", default="", help="Comma-separated list of files changed")
+@click.option("--pre-metric", "pre_metric", type=float, default=None,
+              help="Metric value before (optional)")
+@click.option("--post-metric", "post_metric", type=float, default=None,
+              help="Metric value after (optional)")
+@click.option("--note", default="", help="Optional note stored in cycle JSON and KG summary")
+@click.option(
+    "--force",
+    is_flag=True,
+    default=False,
+    help="Sync even if a daemon cycle already exists for this directive ID or KG shows COMPLETED",
+)
+def sync(
+    target_dir: str,
+    directive_id: str,
+    title: str,
+    status_val: str,
+    layer: str,
+    files: str,
+    pre_metric: float | None,
+    post_metric: float | None,
+    note: str,
+    force: bool,
+):
+    """Ingest a human-issued directive into the KG, memory, and cycle history."""
+    from datetime import datetime
+
+    from . import memory as mem_module
+    from .config import load_config
+    from .knowledge_graph import KnowledgeGraph
+
+    root = _find_project_root(Path(target_dir).resolve())
+    if not (root / "metaharness.toml").exists():
+        console.print(
+            "[red]No metaharness.toml found. Run [bold]metaharness init[/bold] first.[/red]"
+        )
+        raise SystemExit(1)
+
+    cfg = load_config(root)
+
+    files_changed = [p.strip() for p in files.split(",") if p.strip()]
+
+    if pre_metric is not None and post_metric is not None:
+        delta = post_metric - pre_metric
+    else:
+        delta = None
+
+    cycle_id = f"sync_{directive_id}_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}"
+    timestamp = datetime.utcnow().isoformat() + "Z"
+
+    cycle_dir = cfg.product_cycles_dir if layer == "product" else cfg.maintenance_cycles_dir
+    cycle_dir.mkdir(parents=True, exist_ok=True)
+
+    if not force:
+        for path in cycle_dir.glob("*.json"):
+            try:
+                existing_data = json.loads(path.read_text(encoding="utf-8"))
+            except (json.JSONDecodeError, OSError):
+                continue
+            if existing_data.get("directive") != directive_id:
+                continue
+            if existing_data.get("synced") is True:
+                continue
+            console.print(
+                f"[yellow]Warning: daemon cycle already exists for {directive_id}. "
+                f"Use --force to sync anyway.[/yellow]"
+            )
+            console.print(f"[dim]  Existing: {path.name}[/dim]")
+            return
+
+    payload = {
+        "cycle_id": cycle_id,
+        "timestamp": timestamp,
+        "directive": directive_id,
+        "directive_title": title,
+        "status": status_val,
+        "delta": delta,
+        "pre_metric": pre_metric,
+        "post_metric": post_metric,
+        "changes_applied": len(files_changed),
+        "error": "",
+        "layer": layer,
+        "synced": True,
+        "note": note,
+    }
+
+    cycle_path = cycle_dir / f"{cycle_id}.json"
+    content = note or title
+
+    kg = KnowledgeGraph(cfg.kg_path)
+    try:
+        if not force:
+            existing_node = kg.get_node(directive_id)
+            if existing_node and existing_node.get("status") == "COMPLETED":
+                console.print(
+                    f"[yellow]Warning: {directive_id} already exists in KG as COMPLETED. "
+                    f"Use --force to update.[/yellow]"
+                )
+                return
+
+        cycle_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+        kg.ingest_cycle_outcome(
+            directive_id=directive_id,
+            directive_title=title,
+            directive_content=content,
+            status=status_val,
+            files_changed=files_changed,
+            metric_name=cfg.goals.primary_metric or "",
+            metric_before=pre_metric,
+            metric_after=post_metric,
+            failing_tests=[],
+            failure_detail=None,
+            layer=layer,
+        )
+    finally:
+        kg.close()
+
+    mem_module.update(
+        cfg.memory_dir,
+        cfg.project.name,
+        directive_id,
+        title,
+        status_val,
+        delta,
+        files_changed,
+        pre_metric,
+        post_metric,
+        cfg.goals.primary_metric or "",
+        directive_content=content,
+        layer=layer,
+    )
+
+    console.print(f"[green]✓ Synced {directive_id} → {status_val}[/green]")
+    console.print(f"[dim]  Cycle JSON: {cycle_path}[/dim]")
+    console.print(f"[dim]  KG + memory updated.[/dim]")
+
+
+@main.command()
+@click.option("--dir", "target_dir", default=".", help="Project root directory")
+def memmap(target_dir: str):
+    """Print the ASCII memory map for this project."""
+    from .config import load_config
+    from . import memory as mem_module
+
+    root = _find_project_root(Path(target_dir).resolve())
+    cfg = load_config(root)
+
+    if not cfg.memory.enabled:
+        console.print("[yellow]Memory is disabled in metaharness.toml ([memory] enabled = false)[/yellow]")
+        return
+
+    mem = mem_module.load(cfg.memory_dir)
+    if mem.total_cycles == 0:
+        console.print("[dim]No memory yet — run at least one cycle first.[/dim]")
+        return
+
+    console.print(mem_module.render_map(mem))
+
+
+@main.command()
+@click.option("--dir", "target_dir", default=".", help="Project root directory")
+@click.option("--reset", is_flag=True, help="Wipe memory (irreversible)")
+def memory(target_dir: str, reset: bool):
+    """Show compact memory context (what the diagnoser/proposer see) or reset memory."""
+    from .config import load_config
+    from . import memory as mem_module
+
+    root = _find_project_root(Path(target_dir).resolve())
+    cfg = load_config(root)
+
+    if not cfg.memory.enabled:
+        console.print("[yellow]Memory disabled.[/yellow]")
+        return
+
+    if reset:
+        mem_path = cfg.memory_dir / "project_memory.json"
+        if mem_path.exists():
+            mem_path.unlink()
+        console.print("[red]Memory wiped.[/red]")
+        return
+
+    mem = mem_module.load(cfg.memory_dir)
+    ctx = mem_module.compact_context(mem)
+    if not ctx:
+        console.print("[dim]No memory yet.[/dim]")
+    else:
+        console.print("[bold]Compact context injected into Cursor Agent prompts:[/bold]\n")
+        console.print(ctx)
+        tokens_est = len(ctx.split())
+        console.print(f"\n[dim]~{tokens_est} tokens[/dim]")
+
+
+@main.command()
+@click.option("--dir", "target_dir", default=".", help="Project root directory")
+@click.option("--cycle", "cycle_id", default="", help="Specific cycle ID (default: latest)")
+@click.option("--phase", type=click.Choice(["1", "2", "all"]), default="all")
+def reasoning(target_dir: str, cycle_id: str, phase: str):
+    """Show the agent reasoning log for a cycle (single yolo phase; legacy multi-phase supported)."""
+    from .config import load_config
+
+    root = _find_project_root(Path(target_dir).resolve())
+    cfg = load_config(root)
+    reasoning_roots = [
+        cfg.maintenance_reasoning_dir,
+        cfg.product_reasoning_dir,
+        cfg.reasoning_dir,
+    ]
+
+    def _all_reasoning_logs(pattern: str) -> list[Path]:
+        out: list[Path] = []
+        for rd in reasoning_roots:
+            if rd.is_dir():
+                out.extend(rd.glob(pattern))
+        return sorted(out, key=lambda p: p.stat().st_mtime, reverse=True)
+
+    if not any(rd.is_dir() and list(rd.glob("*.md")) for rd in reasoning_roots):
+        console.print("[dim]No reasoning logs yet. Logs are created during agent cycles.[/dim]")
+        return
+
+    if not cycle_id:
+        # Prefer current single-phase log; fall back to legacy ANALYZE / EXECUTE names
+        for pattern in ("*_execute.md", "*_2_execute.md", "*_1_analyze.md", "*_1_observe.md"):
+            all_logs = _all_reasoning_logs(pattern)
+            if all_logs:
+                break
+        else:
+            console.print("[dim]No reasoning logs found.[/dim]")
+            return
+        stem = all_logs[0].stem
+        for suffix in ("_execute", "_2_execute", "_1_analyze", "_1_observe"):
+            if stem.endswith(suffix):
+                cycle_id = stem[: -len(suffix)]
+                break
+        else:
+            cycle_id = stem
+        console.print(f"[dim]Showing latest cycle: {cycle_id}[/dim]\n")
+
+    # phase "1" = primary agent log; "2" = legacy EXECUTE-only; "all" = ordered list
+    phases_to_show = {
+        "1": [("execute", "Agent — implementation (yolo)")],
+        "2": [("2_execute", "EXECUTE — Implementation (legacy)")],
+        "all": [
+            ("execute", "Agent — implementation (yolo)"),
+            ("1_analyze", "ANALYZE — Architecture + plan (legacy)"),
+            ("2_execute", "EXECUTE — Implementation (legacy)"),
+        ],
+    }[phase]
+
+    _reasoning_suffix_alts: dict[str, list[str]] = {
+        "execute": ["execute", "2_execute", "3_execute"],
+        "1_analyze": ["1_analyze", "1_observe"],
+        "2_execute": ["2_execute", "3_execute"],
+    }
+
+    for suffix, title in phases_to_show:
+        alts = _reasoning_suffix_alts.get(suffix, [suffix])
+        path = None
+        for rd in reasoning_roots:
+            if not rd.is_dir():
+                continue
+            for a in alts:
+                cand = rd / f"{cycle_id}_{a}.md"
+                if cand.is_file():
+                    path = cand
+                    break
+            if path is not None:
+                break
+        if path and path.exists():
+            console.rule(f"[bold cyan]Phase: {title}[/bold cyan]")
+            console.print(path.read_text(encoding="utf-8")[:8000])
+        else:
+            console.print(f"[dim]{title}: not found ({cycle_id}_{suffix}.md)[/dim]")
+
+
+# ── graph (knowledge graph) ───────────────────────────────────────────────────
+
+
+@main.group()
+def graph():
+    """Query the SQLite knowledge graph (directives, files, metrics, causal edges)."""
+    pass
+
+
+@graph.command("search")
+@click.argument("query")
+@click.option("--dir", "target_dir", default=".", help="Project root directory")
+@click.option("-n", default=20, help="Max results")
+def graph_search(query: str, target_dir: str, n: int):
+    """Full-text search over graph node names and summaries."""
+    from .config import load_config
+    from .knowledge_graph import KnowledgeGraph
+
+    root = _find_project_root(Path(target_dir).resolve())
+    cfg = load_config(root)
+    kg = KnowledgeGraph(cfg.kg_path)
+    ids = kg.search(query, limit=n)
+    if not ids:
+        console.print("[dim]No matches.[/dim]")
+        return
+    for nid in ids:
+        node = kg.get_node(nid)
+        if node:
+            console.print(
+                f"[bold]{nid}[/bold]  ({node['type']}) {node.get('name', '')}"
+            )
+
+
+@graph.command("node")
+@click.argument("node_id")
+@click.option("--dir", "target_dir", default=".", help="Project root directory")
+def graph_node(node_id: str, target_dir: str):
+    """Show one node by id."""
+    from .config import load_config
+    from .knowledge_graph import KnowledgeGraph
+
+    root = _find_project_root(Path(target_dir).resolve())
+    cfg = load_config(root)
+    kg = KnowledgeGraph(cfg.kg_path)
+    node = kg.get_node(node_id)
+    if not node:
+        console.print(f"[red]Node not found: {node_id}[/red]")
+        raise SystemExit(1)
+    console.print_json(data=node)
+
+
+@graph.command("history")
+@click.option("--file", "file_path", default=None, help="File path (as tracked on modified edges)")
+@click.option("--entity", "entity_id", default=None, help="Entity node id (e.g. entity:config_key:foo)")
+@click.option("--dir", "target_dir", default=".", help="Project root directory")
+def graph_history(file_path: str, entity_id: str, target_dir: str):
+    """Show file modification history or entity value history."""
+    from .config import load_config
+    from .knowledge_graph import KnowledgeGraph
+
+    root = _find_project_root(Path(target_dir).resolve())
+    cfg = load_config(root)
+    kg = KnowledgeGraph(cfg.kg_path)
+    if file_path:
+        h = kg.file_history(file_path)
+        console.print_json(data=h)
+    elif entity_id:
+        h = kg.entity_history(entity_id)
+        console.print_json(data=h)
+    else:
+        console.print("[yellow]Specify --file or --entity[/yellow]")
+        raise SystemExit(1)
+
+
+@graph.command("stats")
+@click.option("--dir", "target_dir", default=".", help="Project root directory")
+def graph_stats(target_dir: str):
+    """Node/edge counts and type breakdown."""
+    from .config import load_config
+    from .knowledge_graph import KnowledgeGraph
+
+    root = _find_project_root(Path(target_dir).resolve())
+    cfg = load_config(root)
+    kg = KnowledgeGraph(cfg.kg_path)
+    console.print_json(data=kg.stats())
+
+
+@graph.command("sync-git")
+@click.option("--dir", "target_dir", default=".", help="Project root directory")
+@click.option(
+    "--dry-run",
+    is_flag=True,
+    help="Print how many commits would be ingested without writing the KG.",
+)
+@click.option(
+    "--full",
+    is_flag=True,
+    help="Backfill first-parent history (cap with --max-commits / --since).",
+)
+@click.option(
+    "--max-commits",
+    type=int,
+    default=None,
+    help="Max commits to walk/ingest in this run.",
+)
+@click.option(
+    "--since",
+    type=int,
+    default=None,
+    help="Synonym cap for newest commits to process (combined with --max-commits as min).",
+)
+def graph_sync_git(
+    target_dir: str,
+    dry_run: bool,
+    full: bool,
+    max_commits: int | None,
+    since: int | None,
+):
+    """Record git commits and touched paths in the knowledge graph (cursor stored in KG)."""
+    from .config import load_config
+    from .git_kg_sync import sync_git_to_kg
+
+    root = _find_project_root(Path(target_dir).resolve())
+    if not (root / "metaharness.toml").exists():
+        console.print(
+            "[red]No metaharness.toml found. Run [bold]metaharness init[/bold] first.[/red]"
+        )
+        raise SystemExit(1)
+
+    cfg = load_config(root)
+    try:
+        r = sync_git_to_kg(
+            cfg,
+            dry_run=dry_run,
+            full=full,
+            max_commits=max_commits,
+            since=since,
+        )
+    except RuntimeError as e:
+        console.print(f"[red]{e}[/red]")
+        raise SystemExit(1)
+
+    if r.warning:
+        console.print(f"[yellow]{r.warning}[/yellow]")
+    if r.initialized_cursor:
+        console.print(
+            "[dim]Initialized git sync cursor to HEAD (no history ingested). "
+            "Use [bold]--full[/bold] for backfill.[/dim]"
+        )
+    elif dry_run:
+        console.print(f"[dim]Dry-run: would ingest {r.commits_processed} commit(s).[/dim]")
+    else:
+        console.print(f"[green]Ingested {r.commits_processed} commit(s).[/green]")
+    if r.cursor_sha:
+        console.print(f"[dim]Cursor SHA: {r.cursor_sha[:12]}…[/dim]")
+
+
+# ── vision (KG-backed product vision) ───────────────────────────────────────────
+
+
+@main.group()
+def vision():
+    """Vision management commands."""
+    pass
+
+
+@vision.command("show")
+@click.option("--dir", "target_dir", default=".", help="Project root directory")
+def vision_show(target_dir: str):
+    """Show the current evolved vision from the knowledge graph."""
+    from .config import load_config
+    from . import vision as vision_mod
+    from .memory import get_kg
+
+    root = _find_project_root(Path(target_dir).resolve())
+    cfg = load_config(root)
+    kg = get_kg(cfg)
+    try:
+        v = vision_mod.load_vision(kg)
+        if not v:
+            console.print("[dim]No vision in KG yet. Run a product cycle first.[/dim]")
+            return
+        console.print(vision_mod.vision_prompt_block(kg, cfg))
+        console.print(f"\n[dim]Evolution count: {v.get('evolution_count', 0)}[/dim]")
+        console.print(f"[dim]Last evolved: {v.get('last_evolved_at', 'never')}[/dim]")
+    finally:
+        kg.close()
+
+
+@vision.command("evolve")
+@click.option("--dir", "target_dir", default=".", help="Project root directory")
+def vision_evolve(target_dir: str):
+    """Manually trigger a vision evolution pass."""
+    from .config import load_config
+    from . import vision as vision_mod
+    from .memory import get_kg
+
+    root = _find_project_root(Path(target_dir).resolve())
+    cfg = load_config(root)
+    kg = get_kg(cfg)
+    try:
+        vision_mod.seed_vision(kg, cfg)
+        updated = vision_mod.evolve_vision(kg, cfg)
+        console.print(f"[green]Vision evolved. Count: {updated.get('evolution_count')}[/green]")
+        console.print(f"[dim]Features wanted: {len(updated.get('features_wanted', []))}[/dim]")
+        console.print(f"[dim]Features done (derived): {len(vision_mod.derive_features_done(kg))}[/dim]")
+    finally:
+        kg.close()
+
+
+# ── evidence ────────────────────────────────────────────────────────────────────
+
+
+@main.group()
+def product():
+    """Product agent (vision-driven feature directives)."""
+    pass
+
+
+@product.command("run")
+@click.option("--dir", "target_dir", default=".", help="Project root directory")
+def product_run(target_dir: str):
+    """Run a single product agent cycle."""
+    from .config import load_config
+    from .product_agent import run_product_cycle
+
+    root = _find_project_root(Path(target_dir).resolve())
+    cfg = load_config(root)
+    if not cfg.product.enabled:
+        console.print(
+            "[yellow]Product agent disabled. Set [product] enabled = true in metaharness.toml[/yellow]"
+        )
+        raise SystemExit(1)
+    outcome = run_product_cycle(cfg)
+    raise SystemExit(0 if outcome.status.value == "COMPLETED" else 1)
+
+
+@product.command("status")
+@click.option("--dir", "target_dir", default=".", help="Project root directory")
+@click.option("-n", default=10, help="Number of cycles to show")
+def product_status(target_dir: str, n: int):
+    """Show recent product agent cycle history."""
+    from .config import load_config
+
+    root = _find_project_root(Path(target_dir).resolve())
+    cfg = load_config(root)
+    cdir = cfg.product_cycles_dir
+    logs = sorted(cdir.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True)[:n]
+    if not logs:
+        console.print("[dim]No product cycles recorded yet.[/dim]")
+        return
+    for p in reversed(logs):
+        try:
+            data = json.loads(p.read_text(encoding="utf-8"))
+            ts = data.get("timestamp", "?")[:19].replace("T", " ")
+            dc = data.get("directive_confidence")
+            conf = ""
+            if dc is not None:
+                try:
+                    pct = int(round(float(dc) * 100))
+                    det = str(data.get("directive_confidence_detail") or "")
+                    m = re.search(r"\((high|medium|low)\)", det)
+                    tier = m.group(1) if m else ""
+                    conf = f" {pct}%({tier})" if tier else f" {pct}%"
+                except (TypeError, ValueError):
+                    conf = ""
+            console.print(
+                f"[dim]{ts}[/dim]  {data.get('directive')}  {data.get('status')}{conf}  "
+                f"{data.get('directive_title', '')[:60]}"
+            )
+        except Exception:
+            pass
+
+
+@product.command("roadmap")
+@click.option("--dir", "target_dir", default=".", help="Project root directory")
+def product_roadmap(target_dir: str):
+    """Show product-layer directives from the knowledge graph."""
+    from .config import load_config
+    from .knowledge_graph import KnowledgeGraph, build_cross_layer_context
+
+    root = _find_project_root(Path(target_dir).resolve())
+    cfg = load_config(root)
+    kg = KnowledgeGraph(cfg.kg_path)
+    nodes = kg.get_nodes_by_layer("product", limit=20)
+    if not nodes:
+        console.print("[dim]No product-layer nodes in the knowledge graph yet.[/dim]")
+        return
+    console.print("[bold]Product (KG)[/bold]")
+    for n in nodes:
+        t = (n["data"].get("title") or n["name"] or n["id"]).strip()
+        console.print(f"  • [cyan]{n['id']}[/cyan] {t}  ({n['status']})")
+    console.print()
+    x = build_cross_layer_context(kg, "product")
+    if x.strip():
+        console.print("[bold]Maintenance context[/bold]")
+        console.print(x)
+
+
+@main.command("dashboard")
+@click.option("--dir", "target_dir", default=".", help="Project root directory")
+@click.option(
+    "--host",
+    default=DASHBOARD_DEFAULT_HOST,
+    show_default=True,
+    help="Bind address (0.0.0.0 for all interfaces)",
+)
+@click.option("--port", default=8765, show_default=True, type=int, help="HTTP port")
+def dashboard_cmd(target_dir: str, host: str, port: int):
+    """Start a read-only local web UI for cycles, metrics, and KG/memory paths."""
+    from .config import load_config
+    from . import dashboard as dash
+
+    root = _find_project_root(Path(target_dir).resolve())
+    cfg = load_config(root)
+    if not (root / "metaharness.toml").exists():
+        console.print("[red]No metaharness.toml found. Run [bold]metaharness init[/bold] first.[/red]")
+        raise SystemExit(1)
+    url = f"http://{host}:{port}/"
+    console.print(f"[green]Meta-Harness dashboard[/green] — [bold]{url}[/bold]")
+    console.print("[dim]Read-only data; no authentication (local operator tool). Ctrl+C to stop.[/dim]")
+    try:
+        dash.run_dashboard_server(cfg, host=host, port=port)
+    except OSError as e:
+        console.print(f"[red]Could not bind {host}:{port}: {e}[/red]")
+        raise SystemExit(1)
+    except KeyboardInterrupt:
+        console.print("\n[dim]Stopped.[/dim]")
+
+
+@main.command("evidence")
+@click.option("--dir", "target_dir", default=".", help="Project root directory")
+@click.option("--max-chars", default=12000, help="Truncate assembled prompt sections")
+def evidence_cmd(target_dir: str, max_chars: int):
+    """Collect evidence and print prompt-oriented sections (logs, metrics, tests, AST)."""
+    from . import evidence as ev_mod
+    from .config import load_config
+
+    root = _find_project_root(Path(target_dir).resolve())
+    cfg = load_config(root)
+    ev = ev_mod.collect(cfg)
+    console.print(ev_mod.to_prompt_sections(ev, max_chars=max_chars))
+
+
+# ── slack ──────────────────────────────────────────────────────────────────────
+
+
+@main.group()
+def slack():
+    """Slack controls (configure [slack] in metaharness.toml — one app per project)."""
+    pass
+
+
+@slack.command("listen")
+@click.option("--dir", "target_dir", default=".", help="Project root directory")
+def slack_listen(target_dir: str):
+    """Start Slack Socket Mode listener (foreground, for testing)."""
+    from .config import load_config
+    from . import slack_integration as si
+
+    root = _find_project_root(Path(target_dir).resolve())
+    cfg = load_config(root)
+    if not (root / "metaharness.toml").exists():
+        console.print("[red]No metaharness.toml found.[/red]")
+        raise SystemExit(1)
+    if not cfg.slack.enabled:
+        console.print("[yellow]Slack disabled.[/yellow]")
+        return
+    console.print("[cyan]Starting Slack Socket Mode (CTRL-C to stop)...[/cyan]")
+    try:
+        si.run_socket_mode(cfg)
+    except RuntimeError as e:
+        console.print(f"[red]{e}[/red]")
+        raise SystemExit(1)
+    except KeyboardInterrupt:
+        pass
+
+
+@main.group()
+def research():
+    """Research paper ingestion commands."""
+    pass
+
+
+@research.command("eval")
+@click.argument("url")
+@click.option("--dir", "target_dir", default=".", help="Project root directory")
+def research_eval(url: str, target_dir: str):
+    """Fetch and evaluate a research paper for implementation relevance."""
+    from . import research as research_mod
+    from .config import load_config
+
+    root = _find_project_root(Path(target_dir).resolve())
+    cfg = load_config(root)
+
+    console.print(f"[cyan]Fetching {url}...[/cyan]")
+    paper = research_mod.fetch_paper(url)
+
+    if paper.fetch_error:
+        console.print(f"[red]Fetch failed: {paper.fetch_error}[/red]")
+        return
+
+    console.print(f"[dim]Title: {paper.title}[/dim]")
+    ab = paper.abstract[:200] if paper.abstract else ""
+    console.print(f"[dim]Abstract: {ab}...[/dim]")
+    console.print("[cyan]Evaluating...[/cyan]")
+    ev = research_mod.evaluate_paper(cfg, paper)
+
+    color = {"implement": "green", "monitor": "yellow", "discard": "red"}.get(
+        ev.recommendation, "white"
+    )
+    console.print(f"[{color}]Recommendation: {ev.recommendation.upper()}[/{color}]")
+    console.print(f"Confidence: {ev.confidence:.0%}")
+    console.print(f"Applicable to: {ev.applicable_to}")
+    console.print(f"Difficulty: {ev.implementation_difficulty}")
+    console.print(f"Impact: {ev.expected_impact}")
+    console.print(f"Reason: {ev.reason}")
+
+    if ev.recommendation == "implement":
+        if research_mod.queue_paper(cfg, ev):
+            from .slack_integration import notify_research_queue_item
+
+            notify_research_queue_item(
+                cfg,
+                {
+                    "title": ev.title,
+                    "url": ev.url,
+                    "applicable_to": ev.applicable_to,
+                    "difficulty": ev.implementation_difficulty,
+                },
+            )
+            console.print("[green]✓ Added to product agent queue[/green]")
+        else:
+            console.print(
+                "[yellow]Could not add to queue (full — drop a monitor item or clear first).[/yellow]"
+            )
+
+
+@research.command("queue")
+@click.option("--dir", "target_dir", default=".", help="Project root directory")
+def research_queue(target_dir: str):
+    """Show the current research implementation queue."""
+    from . import research as research_mod
+    from .config import load_config
+
+    root = _find_project_root(Path(target_dir).resolve())
+    cfg = load_config(root)
+    queue = research_mod.get_queue(cfg)
+    if not queue:
+        console.print("[dim]Queue is empty.[/dim]")
+        return
+    for item in queue:
+        t = str(item.get("title", "") or "")
+        console.print(f"  • {t[:60]}")
+        console.print(f"    → {item.get('applicable_to', '')} | {item.get('difficulty', '')}")
+
+
+@research.command("clear")
+@click.argument("url")
+@click.option("--dir", "target_dir", default=".", help="Project root directory")
+def research_clear(url: str, target_dir: str):
+    """Remove a paper from the implementation queue."""
+    from . import research as research_mod
+    from .config import load_config
+
+    root = _find_project_root(Path(target_dir).resolve())
+    cfg = load_config(root)
+    removed = research_mod.clear_queue_item(cfg, url)
+    if removed:
+        console.print("[green]✓ Removed from queue[/green]")
+    else:
+        console.print("[yellow]URL not found in queue[/yellow]")
+
+
+@slack.command("test")
+@click.option("--dir", "target_dir", default=".", help="Project root directory")
+def slack_test_cmd(target_dir: str):
+    """Post a test message to verify Slack integration."""
+    from .config import load_config
+    from . import slack_integration as si
+
+    root = _find_project_root(Path(target_dir).resolve())
+    cfg = load_config(root)
+    if not cfg.slack.enabled:
+        console.print(
+            "[yellow]Slack is disabled. Set [[slack]] enabled = true in metaharness.toml[/yellow]"
+        )
+        return
+    try:
+        si.slack_test(cfg)
+        console.print("[green]✓ Slack test message sent.[/green]")
+    except Exception as e:
+        console.print(f"[red]Slack test failed: {e}[/red]")
+        raise SystemExit(1)
+
+
+if __name__ == "__main__":
+    main()
+
+================================================================================
+FILE: slack_integration.py
+================================================================================"""
+meta_harness/slack_integration.py
+
+Per-project Slack: veto Block Kit, cycle summaries, slash commands, Socket Mode.
+Optional dependency: pip install 'meta-harness[slack]'
+
+Slack app OAuth scopes (Bot Token): ``chat:write`` is required to post the veto
+message; ``chat:update`` is required to replace blocks after Approve/Veto. Some
+workspace tiers or admin settings can block message updates — if ``chat_update``
+returns ``not_allowed_token_type`` or ``missing_scope``, re-check the app install
+scopes in api.slack.com.
+"""
+from __future__ import annotations
+
+import json
+import os
+import threading
+import time
+from pathlib import Path
+from typing import Any, Optional
+
+from rich.console import Console
+
+from .config import HarnessConfig
+
+console = Console()
+
+# Ephemeral slash-command responses (Slack ~3000 chars).
+_SLACK_EPHEMERAL_MAX = 2900
+_SLACK_SEP = "─" * 34
+# Heavy rule for memmap (distinct from memory/status).
+_SLACK_MEMMAP_RULE = "━" * 30
+
+_DIRECTIVE_CHAIN_GLYPH: dict[str, str] = {
+    "COMPLETED": "✅",
+    "TEST_FAILED": "✗",
+    "METRIC_REGRESSION": "📉",
+    "AGENT_FAILED": "✗",
+    "VETOED": "⊘",
+    "ERROR": "✗",
+    "INSUFFICIENT_EVIDENCE": "…",
+}
+
+_CYCLE_STATUS_EMOJI: dict[str, str] = {
+    "COMPLETED": "✅",
+    "TEST_FAILED": "🔴",
+    "METRIC_REGRESSION": "📉",
+    "AGENT_FAILED": "🔴",
+    "VETOED": "⊘",
+    "INSUFFICIENT_EVIDENCE": "⏭",
+    "ERROR": "🔴",
+}
+
+
+def _truncate_slack_ephemeral(text: str, max_len: int = _SLACK_EPHEMERAL_MAX) -> str:
+    if len(text) <= max_len:
+        return text
+    return text[: max_len - 24].rstrip() + "\n_…(truncated)_"
+
+
+def _slack_format_memory(cfg: HarnessConfig, mem: Any) -> str:
+    """Rich mrkdwn summary from `ProjectMemory` (not the agent-injection compact string)."""
+    name = (getattr(mem, "project_name", None) or cfg.project.name or "project").strip() or "project"
+    lines: list[str] = [
+        f"📊 *Harness Memory — {name}*",
+        _SLACK_SEP,
+    ]
+
+    total = int(getattr(mem, "total_cycles", 0) or 0)
+    if total == 0:
+        lines.append("_No harness cycles recorded in memory yet._")
+        return _truncate_slack_ephemeral("\n".join(lines))
+
+    completed = int(getattr(mem, "completed", 0) or 0)
+    failed = int(getattr(mem, "failed", 0) or 0)
+    vetoed = int(getattr(mem, "vetoed", 0) or 0)
+    lines.append(
+        f"🔄 *Cycles:* {total} total | {completed}✓ completed | {failed}✗ failed | {vetoed}⊘ vetoed"
+    )
+
+    metric_name = (getattr(mem, "metric_name", None) or "").strip()
+    metric_current = getattr(mem, "metric_current", None)
+    if metric_name and metric_current is not None:
+        baseline = getattr(mem, "metric_baseline", None)
+        best = getattr(mem, "metric_best", None)
+        b = f"{baseline:.3f}" if isinstance(baseline, (int, float)) else "?"
+        c = f"{float(metric_current):.3f}"
+        best_part = f" | best={float(best):.3f}" if isinstance(best, (int, float)) else ""
+        lines.append(f"📈 *Metric ({metric_name}):* {b} → {c}{best_part}")
+
+    file_touches: dict[str, int] = getattr(mem, "file_touches", None) or {}
+    file_successes: dict[str, int] = getattr(mem, "file_successes", None) or {}
+    if file_touches:
+        lines.append("")
+        lines.append("🔥 *Hot Files:*")
+        top = sorted(file_touches.items(), key=lambda x: x[1], reverse=True)[:5]
+        for path, count in top:
+            display = Path(path).name if path else path
+            succ = int(file_successes.get(path, 0) or 0)
+            pct = round(succ / count * 100) if count else 0
+            lines.append(f"  • {display} ×{count} ({pct}%✓)")
+
+    directives: list[Any] = list(getattr(mem, "directives", None) or [])
+    completed_dirs = [d for d in directives if (d.get("status") if isinstance(d, dict) else None) == "COMPLETED"]
+    wins: list[str] = []
+    for d in reversed(completed_dirs):
+        if not isinstance(d, dict):
+            continue
+        did = d.get("id") or "?"
+        title = (d.get("title") or "").strip() or "(no title)"
+        if len(title) > 52:
+            title = title[:49] + "…"
+        wins.append(f"  • {did} — {title}")
+        if len(wins) >= 3:
+            break
+    if wins:
+        lines.append("")
+        lines.append("✅ *Recent Wins:*")
+        lines.extend(wins)
+
+    pat_lines: list[str] = []
+    for p in (getattr(mem, "failure_patterns", None) or [])[:6]:
+        pat_lines.append(f"  • {p}")
+    for p in (getattr(mem, "dead_ends", None) or [])[:4]:
+        pat_lines.append(f"  • {p} _(dead end)_")
+    for p in (getattr(mem, "success_patterns", None) or [])[:4]:
+        pat_lines.append(f"  • {p} _(success)_")
+    if pat_lines:
+        lines.append("")
+        lines.append("⚠️ *Learned Patterns:*")
+        lines.extend(pat_lines[:12])
+
+    return _truncate_slack_ephemeral("\n".join(lines))
+
+
+def _slack_memmap(mem: Any, cfg: HarnessConfig) -> str:
+    """
+    Slack mrkdwn memory map (separate from terminal ``memory.render_map`` ASCII).
+    Same underlying ``ProjectMemory`` fields; tuned for emoji, *bold* headers, and ━ dividers.
+    """
+    name = (getattr(mem, "project_name", None) or cfg.project.name or "project").strip() or "project"
+    lines: list[str] = [
+        f"*📊 Memory Map — {name}*",
+        _SLACK_MEMMAP_RULE,
+    ]
+
+    total = int(getattr(mem, "total_cycles", 0) or 0)
+    if total == 0:
+        lines.append("_No harness memory yet._")
+        return "\n".join(lines)
+
+    completed = int(getattr(mem, "completed", 0) or 0)
+    failed = int(getattr(mem, "failed", 0) or 0)
+    vetoed = int(getattr(mem, "vetoed", 0) or 0)
+    lu = (getattr(mem, "last_updated", None) or "").strip()
+    if lu and "T" in lu:
+        time_part = lu.split("T", 1)[1][:5]
+        upd = f"{time_part} UTC"
+    elif lu:
+        upd = lu[:16] + ("…" if len(lu) > 16 else "")
+    else:
+        upd = "—"
+    lines.append(f"{total} cycles | {completed}✓ {failed}✗ {vetoed}⊘ | Updated {upd}")
+    lines.append("")
+
+    directives_all: list[Any] = list(getattr(mem, "directives", None) or [])
+    if directives_all:
+        lines.append("*🔗 Directive Chain*")
+        max_cells = 48
+        if len(directives_all) > max_cells:
+            n_omit = len(directives_all) - max_cells
+            window = directives_all[-max_cells:]
+            lines.append(f"_(…{n_omit} older directives omitted)_")
+        else:
+            window = directives_all
+        row_size = 6
+        for row_start in range(0, len(window), row_size):
+            row = window[row_start : row_start + row_size]
+            parts: list[str] = []
+            for d in row:
+                if not isinstance(d, dict):
+                    continue
+                st = str(d.get("status") or "")
+                g = _DIRECTIVE_CHAIN_GLYPH.get(st, "?")
+                did = d.get("id") or "?"
+                parts.append(f"{g} {did}")
+            line = " → ".join(parts)
+            if len(line) > 320:
+                line = line[:317] + "…"
+            lines.append(line)
+        lines.append("")
+
+    file_touches: dict[str, int] = getattr(mem, "file_touches", None) or {}
+    file_successes: dict[str, int] = getattr(mem, "file_successes", None) or {}
+    if file_touches:
+        lines.append("*🔥 File Heat Map*")
+        max_touches = max(file_touches.values())
+        bar_w = 12
+        sorted_files = sorted(file_touches.items(), key=lambda x: x[1], reverse=True)[:8]
+        for path, count in sorted_files:
+            display = Path(path).name if path else str(path)
+            if len(display) > 28:
+                display = display[:25] + "…"
+            bar_len = max(1, round(count / max_touches * bar_w))
+            bar = "█" * bar_len + "░" * (bar_w - bar_len)
+            succ = int(file_successes.get(path, 0) or 0)
+            pct = round(succ / count * 100) if count else 0
+            lines.append(f"{display} ×{count}  {bar}  {pct}%✓")
+        lines.append("")
+
+    metric_name = (getattr(mem, "metric_name", None) or "").strip()
+    trajectory: list[Any] = list(getattr(mem, "metric_trajectory", None) or [])
+    if trajectory and metric_name:
+        lines.append(f"*📈 Metric: {metric_name}*")
+        baseline = getattr(mem, "metric_baseline", None)
+        current = getattr(mem, "metric_current", None)
+        best = getattr(mem, "metric_best", None)
+        if isinstance(baseline, (int, float)) and isinstance(current, (int, float)):
+            gain = float(current) - float(baseline)
+            b_str = f"{float(baseline):.3f}"
+            c_str = f"{float(current):.3f}"
+        else:
+            gain = 0.0
+            b_str = "?"
+            c_str = "?"
+        best_str = f"{float(best):.3f}" if isinstance(best, (int, float)) else "?"
+        lines.append(
+            f"baseline={b_str} → current={c_str} | best={best_str} | gain={gain:+.3f}"
+        )
+        tail = trajectory[-20:]
+        ids = [t[0] for t in tail if isinstance(t, (list, tuple)) and t]
+        dot_count = min(len(tail), 24)
+        dots = "●" * dot_count + ("…" if len(tail) > 24 else "")
+        if len(ids) >= 2:
+            span = f"({ids[0]}→{ids[-1]})"
+        elif len(ids) == 1:
+            span = f"({ids[0]})"
+        else:
+            span = ""
+        lines.append(f"{dots} {span}".rstrip())
+        lines.append("")
+
+    fail_pats = list(getattr(mem, "failure_patterns", None) or [])
+    succ_pats = list(getattr(mem, "success_patterns", None) or [])
+    dead = list(getattr(mem, "dead_ends", None) or [])
+    if fail_pats or succ_pats or dead:
+        lines.append("*🧠 Learned Patterns*")
+        if fail_pats:
+            lines.append(" | ".join(f"⚠️ {p}" for p in fail_pats[:8]))
+        if succ_pats:
+            lines.append(" | ".join(f"✅ {p}" for p in succ_pats[:6]))
+        if dead:
+            lines.append(" | ".join(f"🧱 {p}" for p in dead[:5]))
+
+    return "\n".join(lines).rstrip()
+
+
+def _slack_format_product_cycles(cfg: HarnessConfig) -> str:
+    name = (cfg.project.name or "project").strip() or "project"
+    cdir = cfg.product_cycles_dir
+    logs = sorted(cdir.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True)[:8]
+    lines = [f"🚀 *Product cycles — {name}*", _SLACK_SEP]
+    if not logs:
+        lines.append("_No product cycles yet._")
+        return _truncate_slack_ephemeral("\n".join(lines))
+    for p in logs:
+        try:
+            data = json.loads(p.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        st = str(data.get("status") or "?")
+        emoji = _CYCLE_STATUS_EMOJI.get(st, "•")
+        did = data.get("directive") or "?"
+        title = (data.get("directive_title") or "").strip() or "(no title)"
+        if len(title) > 40:
+            title = title[:37] + "…"
+        lines.append(f"{emoji} {did} | {title} | {st}")
+    return _truncate_slack_ephemeral("\n".join(lines))
+
+
+def _slack_format_product_roadmap(cfg: HarnessConfig) -> str:
+    from .knowledge_graph import KnowledgeGraph, build_cross_layer_context
+
+    name = (cfg.project.name or "project").strip() or "project"
+    lines = [f"🗺 *Product roadmap (KG) — {name}*", _SLACK_SEP]
+    try:
+        kg = KnowledgeGraph(cfg.kg_path)
+        nodes = kg.get_nodes_by_layer("product", limit=15)
+    except Exception as e:
+        lines.append(f"_Could not read graph: {e}_")
+        return _truncate_slack_ephemeral("\n".join(lines))
+    if not nodes:
+        lines.append("_No product-layer directives in the knowledge graph yet._")
+    else:
+        for n in nodes:
+            title = (n["data"].get("title") or n["name"] or n["id"]).strip()
+            if len(title) > 48:
+                title = title[:45] + "…"
+            lines.append(f"• `{n['id']}` — {title} — _{n['status']}_")
+    lines.append("")
+    lines.append("*Maintenance snapshot (compact)*")
+    ctx = build_cross_layer_context(kg, "product")
+    if ctx.strip():
+        lines.append(ctx[:2000])
+    else:
+        lines.append("_No maintenance context._")
+    return _truncate_slack_ephemeral("\n".join(lines))
+
+
+def _research_background(cfg: HarnessConfig, url: str) -> None:
+    from . import research as research_mod
+
+    paper = research_mod.fetch_paper(url)
+    usable = bool(
+        (paper.title or "").strip()
+        or (paper.abstract or "").strip()
+        or (paper.body_excerpt or "").strip()
+    )
+    if paper.fetch_error and not usable:
+        post_message(
+            cfg,
+            f"❌ Could not fetch paper: {paper.fetch_error}\n`{url}`",
+        )
+        return
+    evaluation = research_mod.evaluate_paper(cfg, paper)
+    verdict = research_mod.format_slack_verdict(evaluation)
+    if evaluation.recommendation == "implement":
+        queued = research_mod.queue_paper(cfg, evaluation)
+        if queued:
+            notify_research_queue_item(
+                cfg,
+                {
+                    "title": evaluation.title,
+                    "url": evaluation.url,
+                    "applicable_to": evaluation.applicable_to,
+                    "difficulty": evaluation.implementation_difficulty,
+                },
+            )
+    post_message(cfg, verdict)
+
+
+def _slack_format_status(cfg: HarnessConfig) -> str:
+    """Recent cycle JSON files as mrkdwn, newest first."""
+    name = (cfg.project.name or "project").strip() or "project"
+    logs: list[Path] = []
+    for d in (cfg.maintenance_cycles_dir, cfg.cycles_dir):
+        if d.is_dir():
+            logs.extend(d.glob("*.json"))
+    logs = sorted(logs, key=lambda p: p.stat().st_mtime, reverse=True)[:5]
+    lines = [f"📋 *Recent Cycles — {name}*", _SLACK_SEP]
+    if not logs:
+        lines.append("_No cycles yet._")
+        return _truncate_slack_ephemeral("\n".join(lines))
+
+    for p in logs:
+        try:
+            data = json.loads(p.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        st = str(data.get("status") or "?")
+        emoji = _CYCLE_STATUS_EMOJI.get(st, "•")
+        did = data.get("directive") or "?"
+        title = (data.get("directive_title") or "").strip() or "(no title)"
+        if len(title) > 42:
+            title = title[:39] + "…"
+        nf = data.get("changes_applied")
+        if nf is None and isinstance(data.get("files_changed"), list):
+            nf = len(data["files_changed"])
+        if isinstance(nf, int):
+            files_part = f"{nf} files"
+        else:
+            files_part = "? files"
+        delta = data.get("delta")
+        if isinstance(delta, (int, float)):
+            dpart = f"Δ{float(delta):+.3f}"
+        else:
+            dpart = "Δ n/a"
+        lines.append(f"{emoji} {did} | {title} | {files_part} | {dpart}")
+
+    return _truncate_slack_ephemeral("\n".join(lines))
+
+# One Socket Mode connection per process (Slack app token). Daemon registers on start;
+# `metaharness run` starts a temporary listener during the veto window only if none active.
+_slack_socket_lock = threading.Lock()
+_slack_socket_handler: Any = None
+
+
+def slack_socket_listener_active() -> bool:
+    with _slack_socket_lock:
+        return _slack_socket_handler is not None
+
+
+def register_slack_socket_listener(handler: Any) -> None:
+    global _slack_socket_handler
+    with _slack_socket_lock:
+        _slack_socket_handler = handler
+
+
+def unregister_slack_socket_listener(handler: Any) -> None:
+    global _slack_socket_handler
+    with _slack_socket_lock:
+        if _slack_socket_handler is handler:
+            _slack_socket_handler = None
+
+
+def reset_slack_socket_listener_state() -> None:
+    """Clear the process-global Socket Mode handler (used by tests; safe no-op if none set)."""
+    global _slack_socket_handler
+    with _slack_socket_lock:
+        _slack_socket_handler = None
+
+
+def _socket_client_still_connected(handler: Any) -> bool:
+    """True only when the underlying Slack client reports a real boolean True (not MagicMock)."""
+    client = getattr(handler, "client", None)
+    if client is None:
+        return False
+    fn = getattr(client, "is_connected", None)
+    if not callable(fn):
+        return False
+    try:
+        r = fn()
+    except Exception:
+        return False
+    return r is True
+
+
+def _run_socket_thread(handler: Any) -> None:
+    """
+    Run Socket Mode in a background thread without ``handler.start()`` — ``start()`` installs
+    SIGINT handlers via ``signal.signal``, which fails on Windows when not on the main thread.
+    ``connect()`` only opens the WebSocket.
+    """
+    try:
+        handler.connect()
+        while _socket_client_still_connected(handler):
+            time.sleep(1)
+    except Exception as e:
+        console.print(f"[dim yellow]Socket thread error: {e}[/dim yellow]")
+
+
+def run_socket_handler_background(handler: Any, *, thread_name: str = "metaharness-slack-socket") -> None:
+    """Start ``handler`` on a daemon thread (uses ``connect``, not ``start``)."""
+    threading.Thread(
+        target=_run_socket_thread,
+        args=(handler,),
+        name=thread_name,
+        daemon=True,
+    ).start()
+
+
+try:
+    from slack_bolt import App
+    from slack_bolt.adapter.socket_mode import SocketModeHandler
+    from slack_sdk import WebClient
+
+    _SLACK_AVAILABLE = True
+except ImportError:
+    App = Any  # type: ignore[misc, assignment]
+    SocketModeHandler = Any  # type: ignore[misc, assignment]
+    WebClient = Any  # type: ignore[misc, assignment]
+    _SLACK_AVAILABLE = False
+
+_SLACK_VETO_TS_FILE = "slack_veto_ts.txt"
+_SLACK_PRODUCT_VETO_TS_FILE = "slack_product_veto_ts.txt"
+
+
+def _slack_veto_ts_path(cfg: HarnessConfig) -> Path:
+    return cfg.harness_dir / _SLACK_VETO_TS_FILE
+
+
+def _slack_product_veto_ts_path(cfg: HarnessConfig) -> Path:
+    return cfg.harness_dir / _SLACK_PRODUCT_VETO_TS_FILE
+
+
+def _get_tokens(cfg: HarnessConfig) -> tuple[str, str]:
+    """Return (bot_token, app_token). Raises RuntimeError if missing or invalid."""
+    bot = (cfg.slack.bot_token or os.environ.get(cfg.slack.bot_token_env, "") or "").strip()
+    app = (cfg.slack.app_token or os.environ.get(cfg.slack.app_token_env, "") or "").strip()
+    if not bot:
+        raise RuntimeError(
+            f"Slack bot token not found. Set {cfg.slack.bot_token_env} environment variable."
+        )
+    if not app:
+        raise RuntimeError(
+            f"Slack app token not found. Set {cfg.slack.app_token_env} environment variable."
+        )
+    if not app.startswith("xapp-"):
+        raise RuntimeError(
+            "Slack app token must be an App-Level Token starting with 'xapp-' "
+            "(Socket Mode — create one with connections:write in your Slack app)."
+        )
+    return bot, app
+
+
+def _bot_token(cfg: HarnessConfig) -> str:
+    return (cfg.slack.bot_token or os.environ.get(cfg.slack.bot_token_env, "") or "").strip()
+
+
+def slack_ready(cfg: HarnessConfig) -> bool:
+    return bool(cfg.slack.enabled and _bot_token(cfg) and cfg.slack.post_channel)
+
+
+def socket_tokens_ready(cfg: HarnessConfig) -> bool:
+    if not cfg.slack.enabled or not cfg.slack.socket_mode or not _SLACK_AVAILABLE:
+        return False
+    if not slack_ready(cfg):
+        return False
+    app = (cfg.slack.app_token or os.environ.get(cfg.slack.app_token_env, "") or "").strip()
+    return bool(app.startswith("xapp-"))
+
+
+def _web_client(cfg: HarnessConfig) -> Any:
+    return WebClient(token=_bot_token(cfg))
+
+
+def post_message(cfg: HarnessConfig, text: str) -> Optional[str]:
+    if not cfg.slack.enabled or not _SLACK_AVAILABLE:
+        return None
+    if not slack_ready(cfg):
+        return None
+    try:
+        client = _web_client(cfg)
+        resp = client.chat_postMessage(channel=cfg.slack.post_channel, text=text)
+        if resp.get("ok"):
+            return str(resp.get("ts", "")) or None
+    except Exception:
+        pass
+    return None
+
+
+def notify_research_queue_item(cfg: HarnessConfig, item: dict[str, Any]) -> None:
+    """Post a short mrkdwn alert when a paper lands on the implementation queue."""
+    if not cfg.slack.notify_research_queue:
+        return
+    title = (item.get("title") or item.get("url") or "Research paper").strip()
+    url = (item.get("url") or "").strip()
+    applicable = (item.get("applicable_to") or "").strip()
+    difficulty = (item.get("difficulty") or item.get("implementation_difficulty") or "").strip()
+    lines = [
+        "📌 *Research — ready to implement*",
+        f"*{title}*",
+    ]
+    if url:
+        lines.append(url if url.startswith("http") else f"https://{url}")
+    scope_bits = [x for x in (applicable, difficulty) if x]
+    if scope_bits:
+        lines.append("_" + " | ".join(scope_bits) + "_")
+    text = _truncate_slack_ephemeral("\n".join(lines))
+    post_message(cfg, text)
+
+
+def post_veto_window(
+    cfg: HarnessConfig,
+    directive_id: str,
+    directive_title: str,
+    directive_summary: str,
+    seconds: int,
+    *,
+    channel: Optional[str] = None,
+) -> Optional[str]:
+    if not cfg.slack.enabled or not _SLACK_AVAILABLE or not cfg.slack.post_veto_window:
+        return None
+    if not slack_ready(cfg):
+        return None
+    post_ch = (channel or "").strip() or cfg.slack.post_channel
+    if not post_ch:
+        return None
+    summary = (directive_summary or "")[:400]
+    header_text = f"🔔 Veto Window Open — {directive_id}"
+    blocks = [
+        {
+            "type": "header",
+            "text": {"type": "plain_text", "text": header_text, "emoji": True},
+        },
+        {
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": f"*{directive_title}*\n{summary}",
+            },
+        },
+        {
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": f"⏱ {seconds}s veto window",
+            },
+        },
+        {
+            "type": "actions",
+            "elements": [
+                {
+                    "type": "button",
+                    "text": {"type": "plain_text", "text": "✅ Approve", "emoji": True},
+                    "action_id": "mh_approve",
+                    "style": "primary",
+                },
+                {
+                    "type": "button",
+                    "text": {"type": "plain_text", "text": "🚫 Veto", "emoji": True},
+                    "action_id": "mh_veto",
+                    "style": "danger",
+                },
+            ],
+        },
+        {
+            "type": "context",
+            "elements": [
+                {
+                    "type": "mrkdwn",
+                    "text": "Or delete `.metaharness/PENDING_VETO` to veto from terminal",
+                }
+            ],
+        },
+    ]
+    try:
+        client = _web_client(cfg)
+        resp = client.chat_postMessage(
+            channel=post_ch,
+            text=header_text,
+            blocks=blocks,
+        )
+        if resp.get("ok"):
+            ts = str(resp.get("ts", ""))
+            if ts:
+                ts_file = _slack_veto_ts_path(cfg)
+                ts_file.parent.mkdir(parents=True, exist_ok=True)
+                ts_file.write_text(f"{post_ch}\n{ts}", encoding="utf-8")
+                console.print(f"[dim]Slack veto ts saved: {ts}[/dim]")
+                console.print(f"[dim]Slack veto ts path: {ts_file}[/dim]")
+            return ts or None
+    except Exception:
+        pass
+    return None
+
+
+def _read_veto_ts_file(path: Path) -> tuple[str, str]:
+    raw = path.read_text(encoding="utf-8").strip()
+    if not raw:
+        return "", ""
+    if "\n" in raw:
+        ch, ts = raw.split("\n", 1)
+        return ch.strip(), ts.strip()
+    return "", raw
+
+
+def update_veto_result(cfg: HarnessConfig, approved: bool) -> None:
+    if not cfg.slack.enabled or not _SLACK_AVAILABLE:
+        return
+    ts_path = cfg.harness_dir / _SLACK_VETO_TS_FILE
+    try:
+        if not ts_path.exists():
+            console.print(
+                "[yellow]slack_veto_ts.txt not found — skipping message update[/yellow]"
+            )
+            console.print(f"[dim]update_veto_result: looked for {ts_path.resolve()}[/dim]")
+            return
+        console.print(f"[dim]update_veto_result: found {ts_path.resolve()}[/dim]")
+        ch_stored, ts = _read_veto_ts_file(ts_path)
+        if not ts:
+            console.print("[yellow]slack_veto_ts.txt empty — skipping message update[/yellow]")
+            ts_path.unlink(missing_ok=True)
+            return
+        bot_token = _bot_token(cfg)
+        if not bot_token:
+            console.print("[yellow]update_veto_result: no bot token[/yellow]")
+            return
+        ch = ch_stored or cfg.slack.post_channel
+        if not ch:
+            console.print("[yellow]update_veto_result: no Slack channel configured[/yellow]")
+            return
+        console.print(
+            f"[dim]update_veto_result: chat_update channel={ch!r} ts={ts!r} approved={approved}[/dim]"
+        )
+        client = WebClient(token=bot_token)
+        text = "✅ Approved — proceeding" if approved else "🚫 Vetoed by operator"
+        resp = client.chat_update(channel=ch, ts=ts, text=text, blocks=[])
+        if not resp.get("ok"):
+            console.print(
+                f"[yellow]update_veto_result: chat_update failed: {resp.get('error')}[/yellow]"
+            )
+            return
+        console.print("[dim]update_veto_result: chat_update ok — removed slack_veto_ts.txt[/dim]")
+        ts_path.unlink(missing_ok=True)
+    except Exception as e:
+        console.print(f"[yellow]update_veto_result error: {e}[/yellow]")
+
+
+def post_product_veto_window(
+    cfg: HarnessConfig,
+    directive_id: str,
+    directive_title: str,
+    directive_summary: str,
+    seconds: int,
+) -> Optional[str]:
+    if not cfg.slack.enabled or not _SLACK_AVAILABLE or not cfg.slack.post_veto_window:
+        return None
+    if not slack_ready(cfg):
+        return None
+    post_ch = cfg.product_slack_channel
+    if not post_ch:
+        return None
+    summary = (directive_summary or "")[:400]
+    header_text = f"🚀 Product Directive — {directive_id}"
+    blocks = [
+        {
+            "type": "header",
+            "text": {"type": "plain_text", "text": header_text, "emoji": True},
+        },
+        {
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": f"*Build proposal:* {directive_title}\n{summary}",
+            },
+        },
+        {
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": f"⏱ {seconds}s to veto this product cycle",
+            },
+        },
+        {
+            "type": "actions",
+            "elements": [
+                {
+                    "type": "button",
+                    "text": {"type": "plain_text", "text": "✅ Approve build", "emoji": True},
+                    "action_id": "mh_product_approve",
+                    "style": "primary",
+                },
+                {
+                    "type": "button",
+                    "text": {"type": "plain_text", "text": "🚫 Veto", "emoji": True},
+                    "action_id": "mh_product_veto",
+                    "style": "danger",
+                },
+            ],
+        },
+        {
+            "type": "context",
+            "elements": [
+                {
+                    "type": "mrkdwn",
+                    "text": "Or delete `.metaharness/PENDING_PRODUCT_VETO` to abort from terminal",
+                }
+            ],
+        },
+    ]
+    try:
+        client = _web_client(cfg)
+        resp = client.chat_postMessage(
+            channel=post_ch,
+            text=header_text,
+            blocks=blocks,
+        )
+        if resp.get("ok"):
+            ts = str(resp.get("ts", ""))
+            if ts:
+                ts_file = _slack_product_veto_ts_path(cfg)
+                ts_file.parent.mkdir(parents=True, exist_ok=True)
+                ts_file.write_text(f"{post_ch}\n{ts}", encoding="utf-8")
+            return ts or None
+    except Exception:
+        pass
+    return None
+
+
+def update_product_veto_result(cfg: HarnessConfig, approved: bool) -> None:
+    if not cfg.slack.enabled or not _SLACK_AVAILABLE:
+        return
+    ts_path = _slack_product_veto_ts_path(cfg)
+    try:
+        if not ts_path.exists():
+            return
+        ch_stored, ts = _read_veto_ts_file(ts_path)
+        if not ts:
+            ts_path.unlink(missing_ok=True)
+            return
+        bot_token = _bot_token(cfg)
+        if not bot_token:
+            return
+        ch = ch_stored or cfg.product_slack_channel
+        if not ch:
+            return
+        client = WebClient(token=bot_token)
+        text = "✅ Approved — product build proceeding" if approved else "🚫 Product build vetoed"
+        resp = client.chat_update(channel=ch, ts=ts, text=text, blocks=[])
+        if resp.get("ok"):
+            ts_path.unlink(missing_ok=True)
+    except Exception as e:
+        console.print(f"[yellow]update_product_veto_result error: {e}[/yellow]")
+
+
+def post_cycle_outcome(cfg: HarnessConfig, outcome: Any) -> None:
+    if not cfg.slack.enabled or not _SLACK_AVAILABLE or not cfg.slack.post_cycle_result:
+        return
+    if not slack_ready(cfg):
+        return
+    emoji = {
+        "COMPLETED": "✅",
+        "TEST_FAILED": "🔴",
+        "METRIC_REGRESSION": "📉",
+        "AGENT_FAILED": "🔴",
+        "VETOED": "⊘",
+        "INSUFFICIENT_EVIDENCE": "⏭",
+        "ERROR": "💥",
+    }.get(outcome.status.value, "•")
+    lines = [
+        f"{emoji}  {outcome.directive_id} — {outcome.directive_title}",
+        f"Status: {outcome.status.value}",
+    ]
+    if getattr(outcome, "directive_confidence", None) is not None:
+        d = getattr(outcome, "directive_confidence_detail", "") or ""
+        lines.append(
+            f"Predicted success: {int(round(float(outcome.directive_confidence) * 100))}% — {d[:200]}"
+        )
+    if outcome.pre_metric is not None and outcome.post_metric is not None:
+        d = outcome.delta
+        if d is not None:
+            lines.append(
+                f"Delta: {outcome.pre_metric} → {outcome.post_metric} ({d:+.4f})"
+            )
+        else:
+            lines.append(
+                f"Delta: {outcome.pre_metric} → {outcome.post_metric}"
+            )
+    lines.append(f"Changes: {outcome.changes_applied} file(s)")
+    lines.append(f"Phases: {outcome.phases_completed}/1")
+    text = "\n".join(lines)
+    try:
+        client = _web_client(cfg)
+        client.chat_postMessage(channel=cfg.slack.post_channel, text=text)
+    except Exception:
+        pass
+
+
+def handle_slash_command(cfg: HarnessConfig, command: str, args: str) -> str:
+    sub = (command or "").strip().lower()
+    sc = cfg.slack.slash_command.lstrip("/")
+
+    if sub == "product":
+        parts2 = args.strip().split(None, 1)
+        pverb = (parts2[0] if parts2 else "help").lower()
+        if pverb in ("help", ""):
+            return (
+                f"*/{sc} product*\n"
+                "• `product status` — recent product cycles\n"
+                "• `product roadmap` — product KG + maintenance snapshot\n"
+                "• `product proceed` — approve pending *product* veto from Slack\n"
+                "• `product veto` — abort product cycle (remove PENDING_PRODUCT_VETO)"
+            )
+        if pverb == "status":
+            return _slack_format_product_cycles(cfg)
+        if pverb == "roadmap":
+            return _slack_format_product_roadmap(cfg)
+        if pverb == "proceed":
+            cfg.slack_early_product_approve_path.parent.mkdir(parents=True, exist_ok=True)
+            cfg.slack_early_product_approve_path.write_text("", encoding="utf-8")
+            return "Product early approve set — product veto window will proceed if open."
+        if pverb == "veto":
+            cfg.pending_product_veto_path.unlink(missing_ok=True)
+            return "Product cycle vetoed ⊘"
+        return f"Unknown `product` subcommand. Try `/{sc} product help`."
+
+    if sub == "research":
+        from . import research as research_mod
+
+        a = (args or "").strip()
+        if not a:
+            return (
+                "Usage: `/metaharness research <url>`\n"
+                "• `research <url>` — evaluate a research paper for implementation\n"
+                "• `research discard <url>` — remove from implementation queue\n"
+                "• `research queue` — show pending research queue"
+            )
+        if a.lower() == "queue":
+            queue = research_mod.get_queue(cfg)
+            if not queue:
+                return "📚 Research queue is empty."
+            lines = ["*📚 Research Queue*", "━" * 30]
+            for item in queue:
+                t = str(item.get("title", "") or "")
+                if len(t) > 50:
+                    t = t[:47] + "…"
+                lines.append(f"• *{t}*")
+                lines.append(
+                    f"  → `{item.get('applicable_to', '')}` | {item.get('difficulty', '')}"
+                )
+            return _truncate_slack_ephemeral("\n".join(lines))
+        if a.lower().startswith("discard "):
+            target_url = a[8:].strip()
+            removed = research_mod.clear_queue_item(cfg, target_url)
+            return "✅ Removed from queue." if removed else "❌ URL not found in queue."
+        url = a
+        threading.Thread(
+            target=_research_background,
+            args=(cfg, url),
+            daemon=True,
+            name="metaharness-research",
+        ).start()
+        return f"🔍 Evaluating paper — result posts in ~30s\n`{url}`"
+
+    if sub == "vision":
+        from . import vision as vision_mod
+        from .memory import get_kg
+
+        kg = get_kg(cfg)
+        try:
+            v = vision_mod.load_vision(kg)
+            if not v:
+                return "No vision in KG yet. Run a product cycle first."
+            wanted = v.get("features_wanted", [])
+            done_count = len(vision_mod.derive_features_done(kg))
+            lines = [
+                "*Product Vision*",
+                "=" * 30,
+                v.get("statement", "")[:300],
+                "",
+                f"*Features wanted ({len(wanted)}):*",
+            ]
+            for w in wanted[:8]:
+                lines.append(f"  - {w}")
+            lines.append(f"\n*Features shipped (derived from KG):* {done_count}")
+            lines.append(f"_Evolution count: {v.get('evolution_count', 0)}_")
+            return "\n".join(lines)[:2900]
+        finally:
+            kg.close()
+
+    if sub in ("help", ""):
+        return (
+            f"*/{sc}* — Meta-Harness\n"
+            "• `status` — last 5 maintenance cycles (formatted)\n"
+            "• `memory` — harness memory summary (mrkdwn)\n"
+            "• `memmap` — memory map (mrkdwn, like memory/status)\n"
+            "• `pause` — pause daemon (DAEMON_PAUSE)\n"
+            "• `resume` — resume daemon\n"
+            "• `proceed` — approve pending *maintenance* veto window from Slack\n"
+            "• `veto` — abort maintenance cycle (remove PENDING_VETO)\n"
+            "• `product …` — product agent (`help`, `status`, `roadmap`, `proceed`)\n"
+            "• `research <url>` — evaluate a research paper for implementation\n"
+            "• `research discard <url>` — remove from implementation queue\n"
+            "• `research queue` — show pending research queue\n"
+            "• `vision` — show current evolved product vision\n"
+            "• `help` — this message"
+        )
+
+    if sub == "status":
+        return _slack_format_status(cfg)
+
+    if sub == "memory":
+        from . import memory as mem_module
+
+        if not cfg.memory.enabled:
+            return "Memory disabled in metaharness.toml."
+        mem = mem_module.load(cfg.memory_dir)
+        return _slack_format_memory(cfg, mem)
+
+    if sub == "memmap":
+        from . import memory as mem_module
+
+        if not cfg.memory.enabled:
+            return "Memory disabled in metaharness.toml."
+        mem = mem_module.load(cfg.memory_dir)
+        return _truncate_slack_ephemeral(_slack_memmap(mem, cfg))
+
+    if sub == "pause":
+        cfg.daemon_pause_path.parent.mkdir(parents=True, exist_ok=True)
+        cfg.daemon_pause_path.write_text("", encoding="utf-8")
+        return "Daemon paused ⏸"
+
+    if sub == "resume":
+        cfg.daemon_pause_path.unlink(missing_ok=True)
+        return "Daemon resumed ▶"
+
+    if sub == "proceed":
+        cfg.slack_early_approve_path.parent.mkdir(parents=True, exist_ok=True)
+        cfg.slack_early_approve_path.write_text("", encoding="utf-8")
+        return "Early approve signal set — cycle will proceed if in veto window."
+
+    if sub == "veto":
+        cfg.pending_veto_path.unlink(missing_ok=True)
+        return "Maintenance cycle vetoed ⊘"
+
+    return f"Unknown command `{sub}`. Try `/{sc} help`."
+
+
+def _register_socket_handlers(bolt_app: Any, cfg: HarnessConfig) -> None:
+    cmd = f"/{cfg.slack.slash_command.lstrip('/')}"
+
+    @bolt_app.command(cmd)
+    def slash_handler(ack, command):
+        text = (command.get("text") or "").strip()
+        parts = text.split(None, 1)
+        verb = parts[0] if parts else "help"
+        rest = parts[1] if len(parts) > 1 else ""
+        try:
+            out = handle_slash_command(cfg, verb, rest)
+            return ack(text=out, response_type="ephemeral")
+        except Exception as e:
+            return ack(text=f"Error: {e}", response_type="ephemeral")
+
+    @bolt_app.action("mh_approve")
+    def handle_approve(ack):
+        ack()  # must be first — Slack times out ~3s waiting for acknowledgement
+        try:
+            console.print("[dim]Slack approve handler fired[/dim]")
+            cfg.slack_early_approve_path.parent.mkdir(parents=True, exist_ok=True)
+            cfg.slack_early_approve_path.write_text("approved", encoding="utf-8")
+            update_veto_result(cfg, approved=True)
+        except Exception as e:
+            console.print(f"[yellow]Slack approve handler error: {e}[/yellow]")
+
+    @bolt_app.action("mh_veto")
+    def handle_veto(ack):
+        ack()  # must be first — Slack times out ~3s waiting for acknowledgement
+        try:
+            update_veto_result(cfg, approved=False)
+            cfg.pending_veto_path.unlink(missing_ok=True)
+        except Exception as e:
+            console.print(f"[yellow]Slack veto handler error: {e}[/yellow]")
+
+    @bolt_app.action("mh_product_approve")
+    def handle_product_approve(ack):
+        ack()
+        try:
+            cfg.slack_early_product_approve_path.parent.mkdir(parents=True, exist_ok=True)
+            cfg.slack_early_product_approve_path.write_text("approved", encoding="utf-8")
+            update_product_veto_result(cfg, approved=True)
+        except Exception as e:
+            console.print(f"[yellow]Slack product approve handler error: {e}[/yellow]")
+
+    @bolt_app.action("mh_product_veto")
+    def handle_product_veto(ack):
+        ack()
+        try:
+            update_product_veto_result(cfg, approved=False)
+            cfg.pending_product_veto_path.unlink(missing_ok=True)
+        except Exception as e:
+            console.print(f"[yellow]Slack product veto handler error: {e}[/yellow]")
+
+
+def start_socket_mode(cfg: HarnessConfig) -> Any:
+    """
+    Build Bolt app + SocketModeHandler. Does not open the socket; caller runs
+    ``run_socket_handler_background(handler)`` from a worker thread, or ``handler.start()``
+    when blocking on the main thread (CLI).
+    """
+    if not cfg.slack.enabled or not _SLACK_AVAILABLE:
+        return None
+    if not socket_tokens_ready(cfg):
+        return None
+    try:
+        bot, app_token = _get_tokens(cfg)
+    except RuntimeError:
+        return None
+    bolt_app = App(token=bot)
+    _register_socket_handlers(bolt_app, cfg)
+    return SocketModeHandler(bolt_app, app_token)
+
+
+def slack_test(cfg: HarnessConfig) -> None:
+    if not cfg.slack.enabled:
+        return
+    if not _SLACK_AVAILABLE:
+        raise RuntimeError("slack-bolt / slack-sdk not installed. pip install 'meta-harness[slack]'")
+    if not slack_ready(cfg):
+        raise RuntimeError(
+            "Slack not configured: set [slack] enabled = true, channel, and bot token."
+        )
+    msg = f"🤖 Meta-Harness Slack integration working — {cfg.project.name}"
+    try:
+        client = _web_client(cfg)
+        resp = client.chat_postMessage(channel=cfg.slack.post_channel, text=msg)
+        if not resp.get("ok"):
+            raise RuntimeError(resp.get("error", "chat_postMessage failed"))
+    except RuntimeError:
+        raise
+    except Exception as e:
+        raise RuntimeError(f"Slack post failed: {e}") from e
+
+
+def run_socket_mode(cfg: HarnessConfig) -> None:
+    """Blocking Socket Mode (used by CLI when not using background thread)."""
+    if not cfg.slack.enabled or not _SLACK_AVAILABLE:
+        raise RuntimeError("Slack is disabled or slack-bolt is not installed.")
+    _get_tokens(cfg)
+    handler = start_socket_mode(cfg)
+    if not handler:
+        raise RuntimeError(
+            "Slack Socket Mode could not start — check tokens, channel, and socket_mode."
+        )
+    handler.start()
+
+================================================================================
+FILE: config.py
+================================================================================"""
+meta_harness/config.py
+Load and validate metaharness.toml from a project root.
+"""
+from __future__ import annotations
+
+from pathlib import Path
+
+try:
+    from dotenv import load_dotenv
+
+    load_dotenv(Path(__file__).resolve().parent / ".env")
+except ImportError:
+    pass
+
+import sys
+from dataclasses import dataclass, field
+
+if sys.version_info >= (3, 11):
+    import tomllib
+else:
+    try:
+        import tomllib
+    except ImportError:
+        import tomli as tomllib  # type: ignore
+
+
+# ── Sub-configs ────────────────────────────────────────────────────────────────
+
+@dataclass
+class ProjectConfig:
+    name: str = "my-project"
+    description: str = ""
+
+
+@dataclass
+class RunConfig:
+    command: str = "none"
+    working_dir: str = "."
+    settle_seconds: int = 10
+
+
+@dataclass
+class TestConfig:
+    command: str = "pytest"
+    working_dir: str = "."
+    timeout_seconds: int = 120
+    junit_xml: bool = True
+
+
+@dataclass
+class EvidenceConfig:
+    log_patterns: list[str] = field(default_factory=lambda: ["*.log", "logs/*.log"])
+    metrics_patterns: list[str] = field(default_factory=lambda: ["metrics.json"])
+    max_age_hours: int = 24
+    max_log_lines: int = 500
+
+
+@dataclass
+class ScopeConfig:
+    modifiable: list[str] = field(default_factory=lambda: ["src/**/*.py", "*.py"])
+    protected: list[str] = field(default_factory=lambda: ["metaharness.toml", ".git/**"])
+
+
+@dataclass
+class CycleConfig:
+    interval_seconds: int = 0
+    # Local wall-clock times (24h "HH:MM") for `metaharness daemon` when non-empty; ignores interval_seconds.
+    schedule: list[str] = field(default_factory=list)
+    veto_seconds: int = 120
+    min_evidence_items: int = 1
+    max_directive_history: int = 50
+    # Opt-in: restore agent-touched paths to HEAD after failed tests or metric regression (requires git).
+    rollback_enabled: bool = False
+    # When rollback_enabled: restore tracked/untracked agent paths after pytest fails (default on).
+    rollback_on_test_failure: bool = True
+    # When rollback_enabled: if tests pass but primary metric regresses, revert before completing.
+    rollback_on_metric_regression: bool = True
+    # When true, skip rollback if the worktree has uncommitted changes outside agent paths (conservative).
+    rollback_require_git: bool = True
+    # When false (default), wait until the first scheduled time before the first cycle (no catch-up on daemon start).
+    catch_up: bool = False
+
+
+@dataclass
+class MaintenanceConfig:
+    """Maintenance agent — maps from [maintenance] or legacy [cycle]."""
+
+    interval_seconds: int = 0
+    schedule: list[str] = field(default_factory=list)
+    veto_seconds: int = 120
+    min_evidence_items: int = 1
+    max_directive_history: int = 50
+    slack_channel: str = ""
+
+
+@dataclass
+class ProductConfig:
+    enabled: bool = False
+    interval_seconds: int = 0
+    schedule: list[str] = field(default_factory=list)
+    veto_seconds: int = 600
+    slack_channel: str = ""
+    modifiable: list[str] = field(
+        default_factory=lambda: [
+            "**/*.py",
+            "**/*.md",
+            "**/*.html",
+            "**/*.css",
+            "**/*.js",
+            "**/*.yaml",
+            "**/*.toml",
+        ]
+    )
+    protected: list[str] = field(default_factory=list)
+    # When false (default), wait until the first scheduled product time before the first product cycle.
+    catch_up: bool = False
+
+
+@dataclass
+class VisionConfig:
+    statement: str = ""
+    target_users: str = ""
+    core_value: str = ""
+    north_star_metric: str = ""
+    features_wanted: list[str] = field(default_factory=list)
+    features_done: list[str] = field(default_factory=list)
+    out_of_scope: list[str] = field(default_factory=list)
+
+
+@dataclass
+class CursorConfig:
+    """Cursor Agent CLI (`agent`) — model ids from `agent models` (e.g. composer-2)."""
+
+    agent_bin: str = "agent"
+    model: str = "composer-2"
+    # Optional faster model id (reserved / future use). ANALYZE, diagnose, and EXECUTE json_call use ``model``.
+    model_fast: str = "composer-2-fast"
+    # Single LLM call timeout for agent_call / general phases (alias in TOML: agent_timeout)
+    timeout_seconds: int = 1200
+    # json_call (diagnosis, etc.); None means use timeout_seconds
+    json_timeout: int | None = None
+    json_retries: int = 3
+    # ANALYZE phase: cap loaded files after relevance filter; 0 = unlimited
+    max_files_per_cycle: int = 0
+
+
+@dataclass
+class MemoryConfig:
+    enabled: bool = True
+    # Refresh inferred patterns every N completed cycles
+    pattern_refresh_every: int = 3
+
+
+@dataclass
+class GoalsConfig:
+    objectives: list[str] = field(default_factory=list)
+    primary_metric: str = ""
+    optimization_direction: str = "maximize"
+
+
+@dataclass
+class SlackConfig:
+    """
+    Per-project Slack app. Tokens via environment variables (see *_env keys);
+    optional inline bot_token / app_token for local dev only — do not commit secrets.
+    """
+
+    enabled: bool = False
+    bot_token: str = ""
+    bot_token_env: str = "SLACK_BOT_TOKEN"
+    app_token: str = ""
+    app_token_env: str = "SLACK_APP_TOKEN"
+    channel: str = "#meta-harness"
+    # Legacy TOML key `default_channel` maps to `channel` on load when `channel` is unset.
+    default_channel: str = ""
+    socket_mode: bool = True
+    slash_command: str = "metaharness"
+    socket_autostart_with_daemon: bool = True
+    post_veto_window: bool = True
+    post_cycle_result: bool = True
+    # When true, post a short Slack message when a paper is queued for implementation
+    # (`metaharness research eval` or `/metaharness research <url>`).
+    notify_research_queue: bool = True
+
+    @property
+    def post_channel(self) -> str:
+        """Channel ID or name used for chat.postMessage (prefers `channel`, then legacy default_channel)."""
+        return (self.channel or self.default_channel or "").strip()
+
+
+# ── Root config ────────────────────────────────────────────────────────────────
+
+@dataclass
+class HarnessConfig:
+    project_root: Path
+    project: ProjectConfig = field(default_factory=ProjectConfig)
+    run: RunConfig = field(default_factory=RunConfig)
+    test: TestConfig = field(default_factory=TestConfig)
+    evidence: EvidenceConfig = field(default_factory=EvidenceConfig)
+    scope: ScopeConfig = field(default_factory=ScopeConfig)
+    cycle: CycleConfig = field(default_factory=CycleConfig)
+    maintenance: MaintenanceConfig = field(default_factory=MaintenanceConfig)
+    product: ProductConfig = field(default_factory=ProductConfig)
+    vision: VisionConfig = field(default_factory=VisionConfig)
+    cursor: CursorConfig = field(default_factory=CursorConfig)
+    memory: MemoryConfig = field(default_factory=MemoryConfig)
+    goals: GoalsConfig = field(default_factory=GoalsConfig)
+    slack: SlackConfig = field(default_factory=SlackConfig)
+
+    # Runtime paths (derived, not from toml)
+    @property
+    def harness_dir(self) -> Path:
+        return self.project_root / ".metaharness"
+
+    @property
+    def directives_dir(self) -> Path:
+        return self.harness_dir / "directives"
+
+    @property
+    def cycles_dir(self) -> Path:
+        return self.harness_dir / "cycles"
+
+    @property
+    def maintenance_cycles_dir(self) -> Path:
+        return self.harness_dir / "cycles" / "maintenance"
+
+    @property
+    def product_cycles_dir(self) -> Path:
+        return self.harness_dir / "cycles" / "product"
+
+    @property
+    def maintenance_reasoning_dir(self) -> Path:
+        return self.harness_dir / "reasoning" / "maintenance"
+
+    @property
+    def product_reasoning_dir(self) -> Path:
+        return self.harness_dir / "reasoning" / "product"
+
+    @property
+    def memory_dir(self) -> Path:
+        return self.harness_dir / "memory"
+
+    @property
+    def pending_veto_path(self) -> Path:
+        return self.harness_dir / "PENDING_VETO"
+
+    @property
+    def pending_product_veto_path(self) -> Path:
+        return self.harness_dir / "PENDING_PRODUCT_VETO"
+
+    @property
+    def slack_early_approve_path(self) -> Path:
+        """Touch or create (empty) to skip veto wait and proceed immediately (Slack / operator)."""
+        return self.harness_dir / "SLACK_EARLY_APPROVE"
+
+    @property
+    def slack_early_product_approve_path(self) -> Path:
+        return self.harness_dir / "SLACK_EARLY_APPROVE_PRODUCT"
+
+    @property
+    def daemon_pause_path(self) -> Path:
+        """While this file exists, the daemon skips new cycles (Slack / operator)."""
+        return self.harness_dir / "DAEMON_PAUSE"
+
+    @property
+    def prompts_dir(self) -> Path:
+        return self.harness_dir / "prompts"
+
+    @property
+    def reasoning_dir(self) -> Path:
+        return self.harness_dir / "reasoning"
+
+    @property
+    def kg_path(self) -> Path:
+        return self.harness_dir / "knowledge_graph.db"
+
+    @property
+    def research_dir(self) -> Path:
+        return self.harness_dir / "research"
+
+    @property
+    def research_queue_path(self) -> Path:
+        return self.research_dir / "queue.json"
+
+    @property
+    def veto_context_path(self) -> Path:
+        return self.harness_dir / "veto_context.json"
+
+    @property
+    def agent_lock_path(self) -> Path:
+        """Marker file for agent implementation; lock file is ``AGENT_LOCK.lock``."""
+        return self.harness_dir / "AGENT_LOCK"
+
+    @property
+    def maintenance_slack_channel(self) -> str:
+        return (self.maintenance.slack_channel or "").strip() or self.slack.post_channel
+
+    @property
+    def product_slack_channel(self) -> str:
+        return (self.product.slack_channel or "").strip() or self.slack.post_channel
+
+
+def _slack_channel_from_raw(sl_raw: dict) -> str:
+    if "channel" in sl_raw:
+        return str(sl_raw.get("channel") or "")
+    if "default_channel" in sl_raw:
+        return str(sl_raw.get("default_channel") or "")
+    return "#meta-harness"
+
+
+def load_config(project_root: Path) -> HarnessConfig:
+    """Load metaharness.toml from project_root. Returns defaults if missing."""
+    config_path = project_root / "metaharness.toml"
+    raw: dict = {}
+    if config_path.exists():
+        with open(config_path, "rb") as f:
+            raw = tomllib.load(f)
+
+    def _section(key: str) -> dict:
+        return raw.get(key, {})
+
+    proj_raw = _section("project")
+    run_raw = _section("run")
+    test_raw = _section("test")
+    ev_raw = _section("evidence")
+    sc_raw = _section("scope")
+    cy_raw = _section("cycle")
+    _mh_exists = "maintenance" in raw and isinstance(raw.get("maintenance"), dict)
+    mh_raw = _section("maintenance") if _mh_exists else {}
+    pr_raw = _section("product")
+    vi_raw = _section("vision")
+    cu_raw = _section("cursor")
+    go_raw = _section("goals")
+    sl_raw = _section("slack")
+
+    def _schedule_list(src: dict) -> list[str]:
+        sraw = src.get("schedule", [])
+        if isinstance(sraw, list):
+            return [str(x).strip() for x in sraw if str(x).strip()]
+        return []
+
+    if _mh_exists:
+        _cycle_src = {**cy_raw, **mh_raw}
+    else:
+        _cycle_src = cy_raw
+
+    _schedule = _schedule_list(_cycle_src)
+
+    def _multiline_str(d: dict, key: str, default: str = "") -> str:
+        v = d.get(key, default)
+        if v is None:
+            return ""
+        return str(v).strip()
+
+    _features_list = lambda d, k: (
+        [str(x).strip() for x in d.get(k, []) if str(x).strip()]
+        if isinstance(d.get(k), list)
+        else []
+    )
+
+    maintenance_cfg = MaintenanceConfig(
+        interval_seconds=int(_cycle_src.get("interval_seconds", 0)),
+        schedule=_schedule,
+        veto_seconds=int(_cycle_src.get("veto_seconds", 120)),
+        min_evidence_items=int(_cycle_src.get("min_evidence_items", 1)),
+        max_directive_history=int(_cycle_src.get("max_directive_history", 50)),
+        slack_channel=str(mh_raw.get("slack_channel", "") or "").strip()
+        if _mh_exists
+        else "",
+    )
+
+    product_modifiable = pr_raw.get("modifiable")
+    if not isinstance(product_modifiable, list) or not product_modifiable:
+        product_modifiable = [
+            "**/*.py",
+            "**/*.md",
+            "**/*.html",
+            "**/*.css",
+            "**/*.js",
+            "**/*.yaml",
+            "**/*.toml",
+        ]
+    product_protected = pr_raw.get("protected", [])
+    if not isinstance(product_protected, list):
+        product_protected = []
+
+    product_cfg = ProductConfig(
+        enabled=bool(pr_raw.get("enabled", False)),
+        interval_seconds=int(pr_raw.get("interval_seconds", 0)),
+        schedule=_schedule_list(pr_raw),
+        veto_seconds=int(pr_raw.get("veto_seconds", 600)),
+        slack_channel=str(pr_raw.get("slack_channel", "") or "").strip(),
+        modifiable=[str(x) for x in product_modifiable],
+        protected=[str(x) for x in product_protected],
+        catch_up=bool(pr_raw.get("catch_up", False)),
+    )
+
+    vision_cfg = VisionConfig(
+        statement=_multiline_str(vi_raw, "statement"),
+        target_users=_multiline_str(vi_raw, "target_users"),
+        core_value=_multiline_str(vi_raw, "core_value"),
+        north_star_metric=_multiline_str(vi_raw, "north_star_metric"),
+        features_wanted=_features_list(vi_raw, "features_wanted"),
+        features_done=_features_list(vi_raw, "features_done"),
+        out_of_scope=_features_list(vi_raw, "out_of_scope"),
+    )
+
+    cfg = HarnessConfig(
+        project_root=project_root,
+        project=ProjectConfig(
+            name=proj_raw.get("name", "my-project"),
+            description=proj_raw.get("description", ""),
+        ),
+        run=RunConfig(
+            command=run_raw.get("command", "none"),
+            working_dir=run_raw.get("working_dir", "."),
+            settle_seconds=run_raw.get("settle_seconds", 10),
+        ),
+        test=TestConfig(
+            command=test_raw.get("command", "pytest"),
+            working_dir=test_raw.get("working_dir", "."),
+            timeout_seconds=test_raw.get("timeout_seconds", 120),
+            junit_xml=bool(test_raw.get("junit_xml", True)),
+        ),
+        evidence=EvidenceConfig(
+            log_patterns=ev_raw.get("log_patterns", ["*.log"]),
+            metrics_patterns=ev_raw.get("metrics_patterns", ["metrics.json"]),
+            max_age_hours=ev_raw.get("max_age_hours", 24),
+            max_log_lines=ev_raw.get("max_log_lines", 500),
+        ),
+        scope=ScopeConfig(
+            modifiable=sc_raw.get("modifiable", ["src/**/*.py", "*.py"]),
+            protected=sc_raw.get("protected", ["metaharness.toml", ".git/**"]),
+        ),
+        cycle=CycleConfig(
+            interval_seconds=int(_cycle_src.get("interval_seconds", 0)),
+            schedule=maintenance_cfg.schedule,
+            veto_seconds=int(_cycle_src.get("veto_seconds", 120)),
+            min_evidence_items=int(_cycle_src.get("min_evidence_items", 1)),
+            max_directive_history=int(_cycle_src.get("max_directive_history", 50)),
+            rollback_enabled=bool(_cycle_src.get("rollback_enabled", False)),
+            rollback_on_test_failure=bool(_cycle_src.get("rollback_on_test_failure", True)),
+            rollback_on_metric_regression=bool(
+                _cycle_src.get("rollback_on_metric_regression", True)
+            ),
+            rollback_require_git=bool(_cycle_src.get("rollback_require_git", True)),
+            catch_up=bool(_cycle_src.get("catch_up", False)),
+        ),
+        maintenance=maintenance_cfg,
+        product=product_cfg,
+        vision=vision_cfg,
+        cursor=CursorConfig(
+            agent_bin=cu_raw.get("agent_bin", "agent"),
+            model=cu_raw.get("model", "composer-2"),
+            model_fast=cu_raw.get("model_fast", "composer-2-fast"),
+            timeout_seconds=cu_raw.get(
+                "timeout_seconds", cu_raw.get("agent_timeout", 1200)
+            ),
+            json_timeout=cu_raw.get("json_timeout"),
+            json_retries=int(cu_raw.get("json_retries", 3)),
+            max_files_per_cycle=int(cu_raw.get("max_files_per_cycle", 0)),
+        ),
+        memory=MemoryConfig(
+            enabled=raw.get("memory", {}).get("enabled", True),
+            pattern_refresh_every=raw.get("memory", {}).get("pattern_refresh_every", 3),
+        ),
+        goals=GoalsConfig(
+            objectives=go_raw.get("objectives", []),
+            primary_metric=go_raw.get("primary_metric", ""),
+            optimization_direction=go_raw.get("optimization_direction", "maximize"),
+        ),
+        slack=SlackConfig(
+            enabled=bool(sl_raw.get("enabled", False)),
+            bot_token=str(sl_raw.get("bot_token", "") or ""),
+            bot_token_env=str(
+                sl_raw.get("bot_token_env", "SLACK_BOT_TOKEN") or "SLACK_BOT_TOKEN"
+            ),
+            app_token=str(sl_raw.get("app_token", "") or ""),
+            app_token_env=str(
+                sl_raw.get("app_token_env", "SLACK_APP_TOKEN") or "SLACK_APP_TOKEN"
+            ),
+            channel=_slack_channel_from_raw(sl_raw),
+            default_channel=str(sl_raw.get("default_channel", "") or ""),
+            socket_mode=bool(sl_raw.get("socket_mode", True)),
+            slash_command=str(sl_raw.get("slash_command", "metaharness") or "metaharness").lstrip(
+                "/"
+            ),
+            socket_autostart_with_daemon=bool(
+                sl_raw.get("socket_autostart_with_daemon", True)
+            ),
+            post_veto_window=bool(sl_raw.get("post_veto_window", True)),
+            post_cycle_result=bool(sl_raw.get("post_cycle_result", True)),
+            notify_research_queue=bool(sl_raw.get("notify_research_queue", True)),
+        ),
+    )
+
+    # Ensure runtime dirs exist
+    cfg.harness_dir.mkdir(parents=True, exist_ok=True)
+    cfg.directives_dir.mkdir(parents=True, exist_ok=True)
+    cfg.cycles_dir.mkdir(parents=True, exist_ok=True)
+    cfg.maintenance_cycles_dir.mkdir(parents=True, exist_ok=True)
+    cfg.product_cycles_dir.mkdir(parents=True, exist_ok=True)
+    cfg.memory_dir.mkdir(parents=True, exist_ok=True)
+    cfg.prompts_dir.mkdir(parents=True, exist_ok=True)
+    cfg.reasoning_dir.mkdir(parents=True, exist_ok=True)
+    cfg.maintenance_reasoning_dir.mkdir(parents=True, exist_ok=True)
+    cfg.product_reasoning_dir.mkdir(parents=True, exist_ok=True)
+    cfg.research_dir.mkdir(parents=True, exist_ok=True)
+
+    return cfg
+
+================================================================================
+FILE: research.py
+================================================================================"""
+meta_harness/research.py
+
+Research paper fetch, relevance evaluation (Cursor plan mode), and implementation queue.
+"""
+from __future__ import annotations
+
+import io
+import json
+import re
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+from urllib.parse import urlparse
+
+try:
+    import httpx
+except ImportError:
+    httpx = None  # type: ignore[assignment]
+
+try:
+    from pypdf import PdfReader
+except ImportError:
+    PdfReader = None  # type: ignore[misc, assignment]
+
+from . import cursor_client
+from .config import HarnessConfig
+
+_USER_AGENT = "MetaHarness/1.0"
+_FETCH_TIMEOUT = 30.0
+_BODY_EXCERPT_MAX = 3000
+
+
+@dataclass
+class PaperContent:
+    url: str
+    title: str = ""
+    abstract: str = ""
+    body_excerpt: str = ""
+    fetch_error: str = ""
+    source_type: str = ""
+
+
+@dataclass
+class ResearchEvaluation:
+    url: str
+    title: str
+    relevant: bool
+    confidence: float
+    applicable_to: str
+    implementation_difficulty: str
+    expected_impact: str
+    recommendation: str
+    reason: str
+    raw: str = ""
+
+
+def _http_get(url: str) -> Any:
+    assert httpx is not None
+    return httpx.get(
+        url,
+        timeout=_FETCH_TIMEOUT,
+        follow_redirects=True,
+        headers={"User-Agent": _USER_AGENT},
+    )
+
+
+def _extract_title_from_html(html: str) -> str:
+    m = re.search(r'<h1[^>]*class="[^"]*title[^"]*"[^>]*>([\s\S]*?)</h1>', html, re.I)
+    if m:
+        return re.sub(r"<[^>]+>", "", m.group(1)).strip()
+    m = re.search(r"<title>([^<]+)</title>", html, re.I)
+    if m:
+        return re.sub(r"\s+", " ", m.group(1)).strip()
+    return ""
+
+
+def _extract_arxiv_abstract(html: str) -> str:
+    m = re.search(
+        r'<blockquote[^>]*class="[^"]*abstract[^"]*"[^>]*>([\s\S]*?)</blockquote>',
+        html,
+        re.I,
+    )
+    if not m:
+        return ""
+    inner = m.group(1)
+    inner = re.sub(r"<h2[^>]*>Abstract</h2>", "", inner, flags=re.I)
+    return re.sub(r"<[^>]+>", "", inner).strip()
+
+
+def _extract_html_meta_description(html: str) -> str:
+    m = re.search(
+        r'<meta\s+name=["\']description["\']\s+content=["\']([^"\']*)["\']',
+        html,
+        re.I,
+    )
+    if m:
+        return m.group(1).strip()
+    m = re.search(
+        r'<meta\s+content=["\']([^"\']*)["\']\s+name=["\']description["\']',
+        html,
+        re.I,
+    )
+    return m.group(1).strip() if m else ""
+
+
+def _first_paragraph_text(html: str) -> str:
+    m = re.search(r"<p[^>]*>([\s\S]*?)</p>", html, re.I)
+    if not m:
+        return ""
+    return re.sub(r"<[^>]+>", "", m.group(1)).strip()
+
+
+def _parse_pdf_text(pdf_bytes: bytes, max_pages: int) -> str:
+    if PdfReader is None:
+        raise RuntimeError("pypdf is not installed (required for PDF text extraction)")
+    reader = PdfReader(io.BytesIO(pdf_bytes))
+    parts: list[str] = []
+    n = min(max_pages, len(reader.pages))
+    for i in range(n):
+        try:
+            t = reader.pages[i].extract_text() or ""
+        except Exception:
+            t = ""
+        if t.strip():
+            parts.append(t)
+    return "\n\n".join(parts).strip()
+
+
+def _arxiv_abs_and_pdf_urls(url: str) -> tuple[str, str] | None:
+    p = urlparse(url)
+    host = (p.netloc or "").lower()
+    if "arxiv.org" not in host:
+        return None
+    path = p.path or ""
+    m_abs = re.match(r"^/abs/([^/]+)/?$", path, re.I)
+    m_pdf = re.match(r"^/pdf/([^/]+?)(?:\.pdf)?/?$", path, re.I)
+    aid = (m_abs or m_pdf)
+    if not aid:
+        return None
+    arxiv_id = aid.group(1).strip()
+    if not arxiv_id:
+        return None
+    scheme = p.scheme or "https"
+    base = f"{scheme}://{p.netloc}"
+    abs_url = f"{base}/abs/{arxiv_id}"
+    pdf_url = f"{base}/pdf/{arxiv_id}.pdf"
+    return abs_url, pdf_url
+
+
+def _is_probably_pdf_url(url: str, content_type: str | None) -> bool:
+    u = url.lower().split("?", 1)[0]
+    if u.endswith(".pdf"):
+        return True
+    ct = (content_type or "").lower()
+    return "application/pdf" in ct
+
+
+def _first_non_empty_paragraph(text: str) -> str:
+    for block in re.split(r"\n\s*\n+", text):
+        line = " ".join(block.split())
+        if len(line) > 12:
+            return line[:500]
+    line = " ".join(text.split())
+    return line[:500] if line else ""
+
+
+def fetch_paper(url: str) -> PaperContent:
+    u = (url or "").strip()
+    if not u:
+        return PaperContent(url=url, fetch_error="Empty URL")
+    if httpx is None:
+        return PaperContent(
+            url=u,
+            fetch_error="httpx is not installed. Add httpx to the environment (see meta-harness dependencies).",
+        )
+
+    try:
+        arx = _arxiv_abs_and_pdf_urls(u)
+        if arx is not None:
+            abs_url, pdf_url = arx
+            r = _http_get(abs_url)
+            r.raise_for_status()
+            html = r.text or ""
+            title = _extract_title_from_html(html)
+            abstract = _extract_arxiv_abstract(html)
+            body_excerpt = ""
+            if PdfReader is not None:
+                try:
+                    pr = _http_get(pdf_url)
+                    pr.raise_for_status()
+                    full = _parse_pdf_text(pr.content, max_pages=8)
+                    body_excerpt = full[:_BODY_EXCERPT_MAX]
+                except Exception as e:
+                    return PaperContent(
+                        url=u,
+                        title=title,
+                        abstract=abstract,
+                        body_excerpt="",
+                        fetch_error=str(e),
+                        source_type="arxiv",
+                    )
+            else:
+                return PaperContent(
+                    url=u,
+                    title=title,
+                    abstract=abstract,
+                    body_excerpt="",
+                    fetch_error="pypdf is not installed; cannot extract PDF text for arXiv papers.",
+                    source_type="arxiv",
+                )
+            return PaperContent(
+                url=u,
+                title=title,
+                abstract=abstract,
+                body_excerpt=body_excerpt,
+                source_type="arxiv",
+            )
+
+        head = _http_get(u)
+        head.raise_for_status()
+        ct = head.headers.get("content-type", "")
+        if _is_probably_pdf_url(u, ct):
+            if PdfReader is None:
+                return PaperContent(
+                    url=u,
+                    fetch_error="pypdf is not installed; cannot parse PDF.",
+                    source_type="pdf",
+                )
+            try:
+                text = _parse_pdf_text(head.content, max_pages=10)
+            except Exception as e:
+                return PaperContent(
+                    url=u,
+                    fetch_error=str(e),
+                    source_type="pdf",
+                )
+            title = _first_non_empty_paragraph(text) or "PDF document"
+            abstract = text[:500].strip() if text else ""
+            return PaperContent(
+                url=u,
+                title=title[:500],
+                abstract=abstract,
+                body_excerpt=text[:_BODY_EXCERPT_MAX],
+                source_type="pdf",
+            )
+
+        html = head.text or ""
+        title = _extract_title_from_html(html)
+        desc = _extract_html_meta_description(html)
+        para = _first_paragraph_text(html)
+        abstract = desc or para or ""
+        plain = re.sub(r"<[^>]+>", " ", html)
+        plain = re.sub(r"\s+", " ", plain).strip()
+        body = plain[:_BODY_EXCERPT_MAX]
+        return PaperContent(
+            url=u,
+            title=title,
+            abstract=abstract[:2000],
+            body_excerpt=body,
+            source_type="html",
+        )
+    except Exception as e:
+        return PaperContent(url=u, fetch_error=str(e))
+
+
+_EVAL_SYSTEM = (
+    "You evaluate research papers for software project relevance. "
+    "Follow the user instructions and respond with exactly one ```json fenced block as requested."
+)
+
+
+def _eval_user_prompt(cfg: HarnessConfig, paper: PaperContent) -> str:
+    v = cfg.vision
+    return f"""You are evaluating a research paper for implementation relevance.
+
+Project vision: {v.statement}
+Current features (done): {", ".join(v.features_done) if v.features_done else "(none listed)"}
+Roadmap (wanted): {", ".join(v.features_wanted) if v.features_wanted else "(none listed)"}
+
+Paper title: {paper.title}
+Abstract: {paper.abstract}
+Body excerpt: {paper.body_excerpt}
+
+Evaluate strictly:
+- Is this paper's technique genuinely applicable to this specific project?
+- What specific module or feature would benefit?
+- How hard to implement realistically?
+- What measurable improvement would result?
+
+Be conservative — return relevant=false if the connection is weak or speculative.
+
+Respond with a single ```json block:
+{{
+  "relevant": true/false,
+  "confidence": 0.0-1.0,
+  "applicable_to": "specific module or feature name",
+  "implementation_difficulty": "low|medium|high",
+  "expected_impact": "concrete description of improvement",
+  "recommendation": "implement|monitor|discard",
+  "reason": "explanation grounded in the paper content and project vision"
+}}
+"""
+
+
+def _norm_recommendation(s: str) -> str:
+    x = (s or "").strip().lower()
+    if x in ("implement", "monitor", "discard"):
+        return x
+    return "discard"
+
+
+def _norm_difficulty(s: str) -> str:
+    x = (s or "").strip().lower()
+    if x in ("low", "medium", "high"):
+        return x
+    return "medium"
+
+
+def evaluate_paper(cfg: HarnessConfig, paper: PaperContent) -> ResearchEvaluation:
+    base_title = paper.title or paper.url
+    try:
+        j_timeout = cfg.cursor.json_timeout
+        if j_timeout is None:
+            j_timeout = cfg.cursor.timeout_seconds
+        resp = cursor_client.json_call(
+            cfg,
+            _EVAL_SYSTEM,
+            _eval_user_prompt(cfg, paper),
+            label="research_evaluate",
+            timeout_seconds=j_timeout,
+            max_retries=cfg.cursor.json_retries,
+            cursor_mode="plan",
+        )
+        if not resp.success:
+            err = resp.error or "unknown error"
+            return ResearchEvaluation(
+                url=paper.url,
+                title=base_title,
+                relevant=False,
+                confidence=0.0,
+                applicable_to="",
+                implementation_difficulty="medium",
+                expected_impact="",
+                recommendation="discard",
+                reason=f"Evaluation failed: {err}",
+                raw=resp.raw or "",
+            )
+        data = resp.data
+        if not isinstance(data, dict):
+            return ResearchEvaluation(
+                url=paper.url,
+                title=base_title,
+                relevant=False,
+                confidence=0.0,
+                applicable_to="",
+                implementation_difficulty="medium",
+                expected_impact="",
+                recommendation="discard",
+                reason="Evaluation failed: response was not a JSON object",
+                raw=resp.raw or "",
+            )
+        rec = _norm_recommendation(str(data.get("recommendation", "discard")))
+        rel = data.get("relevant")
+        if rec == "discard":
+            relevant = False
+        elif isinstance(rel, bool):
+            relevant = rel
+        else:
+            relevant = rec == "implement"
+        try:
+            conf = float(data.get("confidence", 0.0))
+        except (TypeError, ValueError):
+            conf = 0.0
+        conf = max(0.0, min(1.0, conf))
+        return ResearchEvaluation(
+            url=paper.url,
+            title=base_title,
+            relevant=relevant,
+            confidence=conf,
+            applicable_to=str(data.get("applicable_to", "") or ""),
+            implementation_difficulty=_norm_difficulty(str(data.get("implementation_difficulty", ""))),
+            expected_impact=str(data.get("expected_impact", "") or ""),
+            recommendation=rec,
+            reason=str(data.get("reason", "") or ""),
+            raw=resp.raw or "",
+        )
+    except Exception as e:
+        return ResearchEvaluation(
+            url=paper.url,
+            title=base_title,
+            relevant=False,
+            confidence=0.0,
+            applicable_to="",
+            implementation_difficulty="medium",
+            expected_impact="",
+            recommendation="discard",
+            reason=f"Evaluation failed: {e}",
+            raw="",
+        )
+
+
+def _load_queue_list(path: Path) -> list[dict[str, Any]]:
+    if not path.is_file():
+        return []
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return []
+    if isinstance(raw, list):
+        return [x for x in raw if isinstance(x, dict)]
+    if isinstance(raw, dict) and "items" in raw and isinstance(raw["items"], list):
+        return [x for x in raw["items"] if isinstance(x, dict)]
+    return []
+
+
+def _save_queue_list(path: Path, items: list[dict[str, Any]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(items, indent=2), encoding="utf-8")
+
+
+def queue_paper(cfg: HarnessConfig, evaluation: ResearchEvaluation) -> bool:
+    if evaluation.recommendation != "implement":
+        return False
+    path = cfg.research_queue_path
+    items = _load_queue_list(path)
+    new_item = {
+        "queued_at": datetime.now(timezone.utc).isoformat(),
+        "url": evaluation.url,
+        "title": evaluation.title,
+        "applicable_to": evaluation.applicable_to,
+        "expected_impact": evaluation.expected_impact,
+        "difficulty": evaluation.implementation_difficulty,
+        "reason": evaluation.reason,
+        "recommendation": evaluation.recommendation,
+    }
+    if len(items) >= 10:
+        drop_idx: int | None = None
+        for i, it in enumerate(items):
+            r = str(it.get("recommendation", "implement") or "").lower()
+            if r == "monitor":
+                drop_idx = i
+                break
+        if drop_idx is not None:
+            items.pop(drop_idx)
+        else:
+            return False
+    items.append(new_item)
+    _save_queue_list(path, items)
+    return True
+
+
+def get_queue(cfg: HarnessConfig) -> list[dict[str, Any]]:
+    return list(_load_queue_list(cfg.research_queue_path))
+
+
+def clear_queue_item(cfg: HarnessConfig, url: str) -> bool:
+    target = (url or "").strip()
+    if not target:
+        return False
+    path = cfg.research_queue_path
+    items = _load_queue_list(path)
+    out = [x for x in items if str(x.get("url", "")).strip() != target]
+    if len(out) == len(items):
+        return False
+    _save_queue_list(path, out)
+    return True
+
+
+def format_slack_verdict(evaluation: ResearchEvaluation) -> str:
+    title = evaluation.title or evaluation.url
+    diff = evaluation.implementation_difficulty
+    if evaluation.recommendation == "implement":
+        conf_pct = f"{evaluation.confidence:.0%}"
+        return (
+            "📄 *Research Review — Queued for Implementation*\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"*{title}*\n"
+            f"Applicable to: `{evaluation.applicable_to}`\n"
+            f"Difficulty: {diff} | Confidence: {conf_pct}\n"
+            f"Impact: {evaluation.expected_impact}\n"
+            f"Reason: {evaluation.reason}\n\n"
+            "✅ Added to product agent queue. Will be considered in next product cycle.\n"
+            f"Tap to veto: `/metaharness research discard {evaluation.url}`"
+        )
+    if evaluation.recommendation == "monitor":
+        return (
+            "📄 *Research Review — Interesting, Not Yet*\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"*{title}*\n"
+            f"Reason: {evaluation.reason}\n\n"
+            "👀 Saved to research backlog. Not queued for immediate implementation."
+        )
+    conf_pct = f"{evaluation.confidence:.0%}"
+    return (
+        "📄 *Research Review — Not Applicable*\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"*{title}*\n"
+        f"Confidence: {conf_pct}\n"
+        f"Reason: {evaluation.reason}"
+    )
+
+================================================================================
+FILE: product_agent.py
+================================================================================"""
+meta_harness/product_agent.py
+
+Product agent: vision-grounded diagnosis and feature directives (P_ prefix).
+Runs independently from the maintenance cycle; shares the knowledge graph only.
+"""
+from __future__ import annotations
+
+import json
+import re
+import time
+from dataclasses import dataclass, field
+from datetime import datetime
+from pathlib import Path
+from typing import TYPE_CHECKING, Any, Optional
+
+from rich.console import Console
+from rich.panel import Panel
+
+from . import agent, cursor_client, evidence, rollback
+from . import memory as mem_module
+from .config import HarnessConfig
+from .directive_confidence import format_confidence_rich_line, outcome_detail_string, score_directive
+from .cycle import (
+    CycleOutcome,
+    CycleStatus,
+    _acquire_agent_lock,
+    _read_primary_metric,
+    _release_agent_lock,
+    _restart_project,
+    _run_tests,
+)
+from . import vision as vision_mod
+from .knowledge_graph import build_cross_layer_context
+from .proposer import Directive, _extract_directive_title, _normalize_agent_markdown_body
+
+# Model often emits "# DIRECTIVE: D1" or YAML id: — treat as invalid title, not the harness id.
+_BARE_DIRECTIVE_ID_TITLE = re.compile(r"^[DMP]\d{1,4}(_auto)?$", re.IGNORECASE)
+
+if TYPE_CHECKING:
+    from .knowledge_graph import KnowledgeGraph
+
+console = Console()
+
+_PRODUCT_SYSTEM = """\
+You are the Product Agent for a software project.
+Your job: analyze what exists and what's missing relative to the product vision.
+
+You have access to:
+1. The product vision (what this project is trying to become)
+2. The current codebase (what exists today)
+3. Recent maintenance work (what the maintenance agent has been fixing)
+4. User-facing gaps (what users would want that doesn't exist yet)
+
+Think like a product manager, not an engineer.
+Ask: "What would make this more useful? What's missing? What should exist next?"
+
+Respond ONLY with a JSON code block:
+```json
+{
+  "summary": "...",
+  "existing_features": ["what already works"],
+  "missing_features": ["things users would want that don't exist"],
+  "user_value_gaps": ["functionality gaps that reduce user value"],
+  "next_build_targets": ["highest priority things to build next, most impactful first"],
+  "maintenance_blockers": ["maintenance issues blocking product progress"]
+}
+```
+"""
+
+_PROPOSE_SYSTEM = """\
+You are the Proposer for the Product Agent of a Meta-Harness.
+
+You are building toward a vision, not fixing bugs. The maintenance agent handles bugs and stability — you handle growth.
+
+Given the product diagnosis, write ONE implementation directive for the coding agent:
+- Pick ONE feature from `next_build_targets` (highest impact first).
+- Write a complete implementation directive: new files, new modules, new APIs are allowed when they serve the vision.
+- Be creative and concrete: file paths, acceptance criteria, constraints.
+- Do not duplicate items marked as already shipped or out of scope.
+
+Start your response with a title line: `# DIRECTIVE: <short human-readable title>`
+(use a real feature name — never put a directive id like D1, M003, or P001 in this line; the harness assigns `P_NNN_auto` when saving).
+
+Then write the full directive in markdown. Do not include a YAML `id:` block; the file header is added by the harness.
+"""
+
+_PRODUCT_JSON_RETRY = (
+    "\n\n---\n"
+    "Your previous reply did not include parseable JSON for this product diagnosis. "
+    "Reply with exactly one markdown fenced code block labeled `json` containing only a JSON object "
+    "with keys `summary`, `existing_features`, `missing_features`, `user_value_gaps`, "
+    "`next_build_targets`, and `maintenance_blockers` (arrays of strings where applicable). "
+    "No other text before or after that block.\n"
+)
+
+
+@dataclass
+class ProductDiagnosis:
+    summary: str = ""
+    existing_features: list[str] = field(default_factory=list)
+    missing_features: list[str] = field(default_factory=list)
+    user_value_gaps: list[str] = field(default_factory=list)
+    next_build_targets: list[str] = field(default_factory=list)
+    maintenance_blockers: list[str] = field(default_factory=list)
+    raw: str = ""
+
+
+def _str_list(val: Any) -> list[str]:
+    if val is None:
+        return []
+    if isinstance(val, str):
+        return [val] if val.strip() else []
+    if isinstance(val, list):
+        return [str(x) for x in val]
+    return [str(val)]
+
+
+def _product_from_dict(data: dict[str, Any], raw: str) -> ProductDiagnosis:
+    return ProductDiagnosis(
+        summary=str(data.get("summary", "") or ""),
+        existing_features=_str_list(data.get("existing_features")),
+        missing_features=_str_list(data.get("missing_features")),
+        user_value_gaps=_str_list(data.get("user_value_gaps")),
+        next_build_targets=_str_list(data.get("next_build_targets")),
+        maintenance_blockers=_str_list(data.get("maintenance_blockers")),
+        raw=raw,
+    )
+
+
+def _product_from_response(
+    resp: cursor_client.CursorResponse,
+) -> Optional[ProductDiagnosis]:
+    raw = resp.raw or ""
+    payload: Any = resp.data
+    if not resp.success and payload is None and raw:
+        payload = cursor_client.extract_json(raw)
+    if isinstance(payload, dict):
+        return _product_from_dict(payload, raw)
+    if isinstance(payload, list) and payload and isinstance(payload[0], dict):
+        return _product_from_dict(payload[0], raw)
+    if raw:
+        inner = cursor_client.extract_json(raw)
+        if isinstance(inner, dict):
+            return _product_from_dict(inner, raw)
+    return None
+
+
+def _research_queue_block(cfg: HarnessConfig) -> str:
+    from . import research as research_mod
+
+    queue = research_mod.get_queue(cfg)
+    if not queue:
+        return ""
+    items = "\n".join(
+        f"  - {(q.get('title') or '')[:60]} → {q.get('applicable_to', '')} ({q.get('difficulty', '')}): {q.get('expected_impact', '')}"
+        for q in queue[:5]
+    )
+    return f"\n## Approved Research Papers (implement these)\n{items}\n"
+
+
+def _vision_prompt_block(cfg: HarnessConfig) -> str:
+    v = cfg.vision
+    lines = [
+        "## Product vision",
+        v.statement.strip() or "(not configured — infer from project description)",
+        "",
+        f"**Target users:** {v.target_users.strip() or '—'}",
+        f"**Core value:** {v.core_value.strip() or '—'}",
+        f"**North star:** {v.north_star_metric.strip() or '—'}",
+        "",
+        "### Features wanted",
+        "\n".join(f"- {x}" for x in v.features_wanted) or "- (none listed)",
+        "",
+        "### Already shipped (do not re-propose as net-new)",
+        "\n".join(f"- {x}" for x in v.features_done) or "- (none listed)",
+        "",
+        "### Out of scope",
+        "\n".join(f"- {x}" for x in v.out_of_scope) or "- (none listed)",
+    ]
+    return "\n".join(lines)
+
+
+def _build_diagnose_user_prompt(cfg: HarnessConfig, ev: evidence.Evidence, kg: Optional["KnowledgeGraph"]) -> str:
+    vision_block = (
+        vision_mod.vision_prompt_block(kg, cfg)
+        if kg is not None
+        else _vision_prompt_block(cfg)
+    )
+    parts = [
+        f"# Project: {cfg.project.name}",
+        vision_block,
+    ]
+    rb = _research_queue_block(cfg)
+    if rb.strip():
+        parts.append(rb.rstrip())
+    parts += [
+        "",
+        "## Goals (harness)",
+        "\n".join(f"- {g}" for g in cfg.goals.objectives) or "(none)",
+        "",
+    ]
+    if kg is not None:
+        xctx = build_cross_layer_context(kg, "product")
+        if xctx.strip():
+            parts.append("## Maintenance / stability context\n")
+            parts.append(xctx)
+            parts.append("")
+    if cfg.memory.enabled:
+        mem = mem_module.load(cfg.memory_dir)
+        ctx = mem_module.compact_context(mem, kg=kg)
+        if ctx:
+            parts.append(f"## Harness memory\n```\n{ctx}\n```\n")
+    parts += [
+        "## Evidence",
+        f"Collected at: {ev.collected_at}",
+    ]
+    if ev.metrics.current:
+        parts.append("\n### Metrics\n```json\n" + json.dumps(ev.metrics.current, indent=2) + "\n```")
+    if ev.test_results.strip():
+        parts.append(f"\n### Tests\n```\n{ev.test_results.strip()[:2500]}\n```")
+    if ev.cycle_history.strip():
+        parts.append(f"\n### Recent cycles\n```\n{ev.cycle_history.strip()}\n```")
+    if ev.file_tree.strip():
+        parts.append(f"\n### File tree (excerpt)\n```\n{ev.file_tree.strip()[:4000]}\n```")
+    return "\n".join(parts)
+
+
+def diagnose(
+    cfg: HarnessConfig,
+    ev: evidence.Evidence,
+    kg: Optional["KnowledgeGraph"] = None,
+) -> ProductDiagnosis:
+    if kg is not None:
+        vision_mod.seed_vision(kg, cfg)
+    prompt = _build_diagnose_user_prompt(cfg, ev, kg)
+    j_timeout = cfg.cursor.json_timeout
+    if j_timeout is None:
+        j_timeout = cfg.cursor.timeout_seconds
+    resp = cursor_client.json_call(
+        cfg,
+        _PRODUCT_SYSTEM,
+        prompt,
+        label="product_diagnose",
+        timeout_seconds=j_timeout,
+        max_retries=cfg.cursor.json_retries,
+        parse_retry_user_suffix=_PRODUCT_JSON_RETRY,
+    )
+    found = _product_from_response(resp)
+    if found is not None:
+        return found
+    return ProductDiagnosis(summary=(resp.raw or resp.error or "")[:500], raw=resp.raw or resp.error or "")
+
+
+def _strip_leading_yaml_frontmatter(text: str) -> str:
+    """Remove a leading YAML frontmatter block (`---` … `---`) if present (model sometimes emits id: D1, etc.)."""
+    lines = text.splitlines()
+    if not lines or lines[0].strip() != "---":
+        return text
+    for i in range(1, min(len(lines), 120)):
+        if lines[i].strip() == "---":
+            return "\n".join(lines[i + 1 :]).lstrip("\n")
+    return text
+
+
+def _extract_product_directive_title(content: str) -> str:
+    body = _strip_leading_yaml_frontmatter(content)
+    title = _extract_directive_title(body).strip()
+    if not title or _BARE_DIRECTIVE_ID_TITLE.match(title):
+        for line in body.splitlines():
+            s = line.strip()
+            if s.startswith("# ") and not s.upper().startswith("# DIRECTIVE:"):
+                cand = s[2:].strip()
+                if cand and not _BARE_DIRECTIVE_ID_TITLE.match(cand):
+                    return cand[:240]
+        return "Untitled product directive"
+    return title[:240]
+
+
+def _next_product_directive_id(directives_dir: Path) -> str:
+    """
+    Next id is P{n:03d}_auto based only on existing `.metaharness/directives/P*.md`
+    (never D* / M* — those are maintenance).
+    """
+    d = Path(directives_dir)
+    nums: list[int] = []
+    seen: set[Path] = set()
+    for pattern in ("P*.md", "p*.md"):
+        for p in d.glob(pattern):
+            try:
+                r = p.resolve()
+            except OSError:
+                r = p
+            if r in seen:
+                continue
+            seen.add(r)
+            stem = p.stem
+            m = re.fullmatch(r"P(\d+)_auto", stem, flags=re.IGNORECASE)
+            if m:
+                nums.append(int(m.group(1)))
+    next_num = (max(nums) + 1) if nums else 1
+    return f"P{next_num:03d}_auto"
+
+
+def _build_propose_prompt(cfg: HarnessConfig, diagnosis: ProductDiagnosis, kg: Optional["KnowledgeGraph"]) -> str:
+    mod, prot = product_effective_scope(cfg)
+    in_scope = "\n".join(f"  {pat}" for pat in mod)
+    protected = "\n".join(f"  {pat}" for pat in prot)
+    rq = _research_queue_block(cfg).strip()
+    vision = (
+        vision_mod.vision_prompt_block(kg, cfg)
+        if kg is not None
+        else _vision_prompt_block(cfg)
+    )
+    if rq:
+        vision = f"{vision}\n\n{rq}"
+    return f"""\
+{vision}
+
+---
+
+## Product diagnosis
+
+{diagnosis.summary}
+
+### Existing features
+{chr(10).join(f"- {x}" for x in diagnosis.existing_features) or "- (none)"}
+
+### Missing features
+{chr(10).join(f"- {x}" for x in diagnosis.missing_features) or "- (none)"}
+
+### User value gaps
+{chr(10).join(f"- {x}" for x in diagnosis.user_value_gaps) or "- (none)"}
+
+### Next build targets
+{chr(10).join(f"- {x}" for x in diagnosis.next_build_targets) or "- (none)"}
+
+### Maintenance blockers
+{chr(10).join(f"- {x}" for x in diagnosis.maintenance_blockers) or "- (none)"}
+
+---
+
+## Scope (product agent)
+
+### May modify (globs)
+{in_scope}
+
+### Protected (never touch)
+{protected}
+
+Write the directive now. Use directive id prefix **P_** in the body if you mention an id; the harness will assign `P_NNN_auto` when saving.
+"""
+
+
+def propose(
+    cfg: HarnessConfig,
+    diagnosis: ProductDiagnosis,
+    kg: Optional["KnowledgeGraph"] = None,
+) -> Directive:
+    prompt = _build_propose_prompt(cfg, diagnosis, kg)
+    resp = cursor_client.agent_call(cfg, _PROPOSE_SYSTEM, prompt, label="product_propose")
+    if not resp.success:
+        raise RuntimeError(resp.error or "Product proposer agent_call failed")
+    content = _normalize_agent_markdown_body((resp.raw or "").strip())
+    if not content or len(content) < 50:
+        raise ValueError(
+            f"Product proposer returned empty content. Raw: {repr((resp.raw or '')[:200])}"
+        )
+    body = _strip_leading_yaml_frontmatter(content).strip()
+    if len(body) < 50:
+        raise ValueError(
+            f"Product proposer returned empty content. Raw: {repr((resp.raw or '')[:200])}"
+        )
+    title = _extract_product_directive_title(body)
+    directive_id = _next_product_directive_id(cfg.directives_dir)
+    if not re.fullmatch(r"P\d+_auto", directive_id, flags=re.IGNORECASE):
+        raise RuntimeError(f"Invalid product directive id (internal bug): {directive_id!r}")
+    directive_path = cfg.directives_dir / f"{directive_id}.md"
+    header = f"""\
+---
+id: {directive_id}
+generated: {datetime.utcnow().isoformat()}Z
+project: {cfg.project.name}
+status: pending
+layer: product
+---
+
+"""
+    full_content = header + body
+    directive_path.write_text(full_content, encoding="utf-8")
+    return Directive(id=directive_id, path=directive_path, title=title, content=full_content)
+
+
+def product_effective_scope(cfg: HarnessConfig) -> tuple[list[str], list[str]]:
+    protected = list(dict.fromkeys(list(cfg.scope.protected) + list(cfg.product.protected)))
+    modifiable = cfg.product.modifiable if cfg.product.modifiable else cfg.scope.modifiable
+    return modifiable, protected
+
+
+def _log_product_cycle(cfg: HarnessConfig, outcome: CycleOutcome) -> None:
+    cfg.product_cycles_dir.mkdir(parents=True, exist_ok=True)
+    path = cfg.product_cycles_dir / f"{outcome.cycle_id}.json"
+    data = {
+        "cycle_id": outcome.cycle_id,
+        "timestamp": outcome.timestamp,
+        "directive": outcome.directive_id,
+        "directive_title": outcome.directive_title,
+        "status": outcome.status.value,
+        "delta": outcome.delta,
+        "pre_metric": outcome.pre_metric,
+        "post_metric": outcome.post_metric,
+        "changes_applied": outcome.changes_applied,
+        "error": outcome.error,
+        "rollback_attempted": outcome.rollback_attempted,
+        "rollback_succeeded": outcome.rollback_succeeded,
+        "rollback_detail": outcome.rollback_detail,
+        "layer": "product",
+    }
+    if outcome.directive_confidence is not None:
+        data["directive_confidence"] = outcome.directive_confidence
+    if outcome.directive_confidence_detail:
+        data["directive_confidence_detail"] = outcome.directive_confidence_detail
+    path.write_text(json.dumps(data, indent=2))
+
+
+def _product_veto_window(
+    cfg: HarnessConfig,
+    directive: Directive,
+    diagnosis: ProductDiagnosis,
+) -> bool:
+    seconds = cfg.product.veto_seconds
+    if seconds <= 0:
+        return True
+
+    if cfg.slack_early_product_approve_path.exists():
+        cfg.slack_early_product_approve_path.unlink(missing_ok=True)
+
+    cfg.pending_product_veto_path.write_text(
+        f"Directive: {directive.id}\nTitle: {directive.title}\n"
+        f"Delete this file within {seconds}s to ABORT the product cycle.\n",
+        encoding="utf-8",
+    )
+    console.print(
+        f"[yellow]Product veto window ({seconds}s). "
+        f"Delete [bold].metaharness/PENDING_PRODUCT_VETO[/bold] to abort.[/yellow]"
+    )
+    summary_bits = (diagnosis.next_build_targets or diagnosis.missing_features or [])[:3]
+    summary_line = "\n".join(summary_bits)
+
+    if cfg.slack.enabled:
+        try:
+            from . import slack_integration as slack
+
+            slack.post_product_veto_window(
+                cfg,
+                directive_id=directive.id,
+                directive_title=directive.title,
+                directive_summary=summary_line,
+                seconds=seconds,
+            )
+        except Exception as e:
+            console.print(f"[dim yellow]Slack product veto post failed: {e}[/dim yellow]")
+
+    socket_handler = None
+    socket_started_for_veto = False
+    if cfg.slack.enabled:
+        try:
+            from . import slack_integration as slack
+
+            if slack.socket_tokens_ready(cfg) and not slack.slack_socket_listener_active():
+                socket_handler = slack.start_socket_mode(cfg)
+                if socket_handler:
+                    slack.run_socket_handler_background(
+                        socket_handler, thread_name="metaharness-slack-socket-product-veto"
+                    )
+                    slack.register_slack_socket_listener(socket_handler)
+                    socket_started_for_veto = True
+        except Exception as e:
+            console.print(f"[dim yellow]Slack Socket Mode (product veto) failed: {e}[/dim yellow]")
+
+    try:
+        start = time.time()
+        while time.time() - start < seconds:
+            if cfg.slack_early_product_approve_path.exists():
+                cfg.slack_early_product_approve_path.unlink(missing_ok=True)
+                console.print("[green]Product early approval (Slack).[/green]")
+                if cfg.slack.enabled:
+                    try:
+                        from . import slack_integration as slack
+
+                        slack.update_product_veto_result(cfg, approved=True)
+                    except Exception:
+                        pass
+                cfg.pending_product_veto_path.unlink(missing_ok=True)
+                return True
+            if not cfg.pending_product_veto_path.exists():
+                console.print("[red bold]Product cycle vetoed.[/red bold]")
+                if cfg.slack.enabled:
+                    try:
+                        from . import slack_integration as slack
+
+                        slack.update_product_veto_result(cfg, approved=False)
+                    except Exception:
+                        pass
+                return False
+            time.sleep(2)
+        cfg.pending_product_veto_path.unlink(missing_ok=True)
+        if cfg.slack.enabled:
+            try:
+                from . import slack_integration as slack
+
+                slack.update_product_veto_result(cfg, approved=True)
+            except Exception:
+                pass
+        return True
+    finally:
+        if socket_started_for_veto and socket_handler is not None:
+            from . import slack_integration as slack
+
+            try:
+                socket_handler.close()
+            except Exception:
+                pass
+            try:
+                slack.unregister_slack_socket_listener(socket_handler)
+            except Exception:
+                pass
+
+
+def run_product_cycle(cfg: HarnessConfig) -> CycleOutcome:
+    outcome = _run_product_cycle_inner(cfg)
+    if cfg.slack.enabled:
+        try:
+            from . import slack_integration as slack
+
+            slack.post_cycle_outcome(cfg, outcome)
+        except Exception as e:
+            console.print(f"[dim yellow]Slack product outcome post failed: {e}[/dim yellow]")
+    return outcome
+
+
+def _run_product_cycle_inner(cfg: HarnessConfig) -> CycleOutcome:
+    cycle_id = f"product_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}"
+    now = datetime.utcnow().isoformat() + "Z"
+    outcome = CycleOutcome(cycle_id=cycle_id, timestamp=now)
+    console.rule(f"[bold magenta]Product Agent Cycle: {cycle_id}[/bold magenta]")
+    kg = mem_module.get_kg(cfg)
+
+    console.print("[magenta]▶ Collecting evidence…[/magenta]")
+    ev = evidence.collect(cfg)
+    if not evidence.has_sufficient_evidence(ev, cfg.cycle.min_evidence_items):
+        console.print("[yellow]Insufficient evidence — skipping product cycle.[/yellow]")
+        outcome.status = CycleStatus.INSUFFICIENT_EVIDENCE
+        _log_product_cycle(cfg, outcome)
+        return outcome
+
+    outcome.pre_metric = _read_primary_metric(cfg)
+
+    console.print("[magenta]▶ Product diagnosis…[/magenta]")
+    try:
+        dx = diagnose(cfg, ev, kg)
+        console.print(Panel(dx.summary, title="Product diagnosis", border_style="magenta"))
+    except Exception as e:
+        outcome.status = CycleStatus.ERROR
+        outcome.error = f"Product diagnosis failed: {e}"
+        _log_product_cycle(cfg, outcome)
+        return outcome
+
+    console.print("[magenta]▶ Generating product directive…[/magenta]")
+    try:
+        directive = propose(cfg, dx, kg)
+        outcome.directive_id = directive.id
+        outcome.directive_title = directive.title
+        console.print(f"[green]{directive.id} — {directive.title}[/green]")
+        try:
+            conf = score_directive(cfg, directive, kg, dx.summary)
+            outcome.directive_confidence = conf.score
+            outcome.directive_confidence_detail = outcome_detail_string(conf)
+            console.print(f"[cyan]{format_confidence_rich_line(conf)}[/cyan]")
+        except Exception as e:
+            console.print(f"[dim yellow]Directive confidence skipped: {e}[/dim yellow]")
+    except Exception as e:
+        outcome.status = CycleStatus.ERROR
+        outcome.error = f"Product proposal failed: {e}"
+        _log_product_cycle(cfg, outcome)
+        return outcome
+
+    if not _product_veto_window(cfg, directive, dx):
+        outcome.status = CycleStatus.VETOED
+        _log_product_cycle(cfg, outcome)
+        mem_module.persist_cycle_outcome(
+            cfg,
+            kg=kg,
+            directive_id=outcome.directive_id,
+            directive_title=outcome.directive_title,
+            status=outcome.status.value,
+            delta=None,
+            files_changed=[],
+            pre_metric=outcome.pre_metric,
+            post_metric=None,
+            directive_content=directive.content,
+            failure_detail=None,
+            layer="product",
+        )
+        return outcome
+
+    mod, prot = product_effective_scope(cfg)
+    console.print("[magenta]▶ Agent implementing product directive…[/magenta]")
+    if not _acquire_agent_lock(cfg):
+        outcome.status = CycleStatus.ERROR
+        outcome.error = "Could not acquire agent lock"
+        _log_product_cycle(cfg, outcome)
+        return outcome
+    try:
+        result = agent.run(
+            cfg,
+            directive,
+            cycle_id=cycle_id,
+            evidence=ev,
+            reasoning_dir=cfg.product_reasoning_dir,
+            scope_modifiable=mod,
+            scope_protected=prot,
+        )
+    except Exception as e:
+        outcome.status = CycleStatus.ERROR
+        outcome.error = f"Agent error: {e}"
+        _log_product_cycle(cfg, outcome)
+        return outcome
+    finally:
+        _release_agent_lock(cfg)
+
+    outcome.phases_completed = result.phases_completed
+    if not result.success:
+        outcome.status = CycleStatus.AGENT_FAILED
+        outcome.error = result.error
+        _log_product_cycle(cfg, outcome)
+        mem_module.persist_cycle_outcome(
+            cfg,
+            kg=kg,
+            directive_id=outcome.directive_id,
+            directive_title=outcome.directive_title,
+            status=outcome.status.value,
+            delta=None,
+            files_changed=[c.path for c in result.changes],
+            pre_metric=outcome.pre_metric,
+            post_metric=None,
+            directive_content=directive.content,
+            failure_detail=outcome.error or None,
+            layer="product",
+        )
+        return outcome
+
+    outcome.changes_applied = len(result.changes)
+    passed, test_output = _run_tests(cfg)
+    if not passed:
+        outcome.status = CycleStatus.TEST_FAILED
+        outcome.error = test_output[-500:]
+        rb = rollback.attempt_restore(cfg, result.changes, kind="test_failure")
+        outcome.rollback_attempted = rb.attempted
+        outcome.rollback_succeeded = rb.succeeded if rb.attempted else None
+        outcome.rollback_detail = rb.detail
+        _log_product_cycle(cfg, outcome)
+        failing = [m.group(1) for m in re.finditer(r"FAILED\s+(\S+)", test_output)]
+        fd_parts: list[str] = []
+        if outcome.error:
+            fd_parts.append(outcome.error)
+        if rb.attempted:
+            fd_parts.append(f"rollback: {rb.detail}")
+        failure_detail = "\n".join(fd_parts) if fd_parts else None
+        files_changed = (
+            [] if (rb.attempted and rb.succeeded) else [c.path for c in result.changes]
+        )
+        mem_module.persist_cycle_outcome(
+            cfg,
+            kg=kg,
+            directive_id=outcome.directive_id,
+            directive_title=outcome.directive_title,
+            status=outcome.status.value,
+            delta=None,
+            files_changed=files_changed,
+            pre_metric=outcome.pre_metric,
+            post_metric=None,
+            directive_content=directive.content,
+            failing_tests=failing,
+            failure_detail=failure_detail,
+            layer="product",
+        )
+        return outcome
+
+    _restart_project(cfg)
+    outcome.post_metric = _read_primary_metric(cfg)
+    if outcome.pre_metric is not None and outcome.post_metric is not None:
+        outcome.delta = outcome.post_metric - outcome.pre_metric
+
+    if (
+        outcome.pre_metric is not None
+        and outcome.post_metric is not None
+        and outcome.delta is not None
+        and rollback.is_metric_regression(cfg, outcome.pre_metric, outcome.post_metric)
+        and cfg.cycle.rollback_enabled
+        and cfg.cycle.rollback_on_metric_regression
+    ):
+        rb = rollback.attempt_restore(cfg, result.changes, kind="metric_regression")
+        outcome.rollback_attempted = rb.attempted
+        outcome.rollback_succeeded = rb.succeeded if rb.attempted else None
+        outcome.rollback_detail = rb.detail
+        outcome.status = CycleStatus.METRIC_REGRESSION
+        fd = f"metric regression (delta={outcome.delta:+.4f}); {rb.detail}"
+        _log_product_cycle(cfg, outcome)
+        files_changed = (
+            [] if (rb.attempted and rb.succeeded) else [c.path for c in result.changes]
+        )
+        mem = mem_module.persist_cycle_outcome(
+            cfg,
+            kg=kg,
+            directive_id=outcome.directive_id,
+            directive_title=outcome.directive_title,
+            status=outcome.status.value,
+            delta=outcome.delta,
+            files_changed=files_changed,
+            pre_metric=outcome.pre_metric,
+            post_metric=outcome.post_metric,
+            directive_content=directive.content,
+            failure_detail=fd,
+            layer="product",
+        )
+        if mem is not None and mem.completed % cfg.memory.pattern_refresh_every == 0:
+            mem_module.refresh_patterns(cfg.memory_dir, kg=kg)
+        console.rule(f"[bold yellow]Product cycle ended: {outcome.status.value}[/bold yellow]")
+        return outcome
+
+    outcome.status = CycleStatus.COMPLETED
+    _log_product_cycle(cfg, outcome)
+    mem = mem_module.persist_cycle_outcome(
+        cfg,
+        kg=kg,
+        directive_id=outcome.directive_id,
+        directive_title=outcome.directive_title,
+        status=outcome.status.value,
+        delta=outcome.delta,
+        files_changed=[c.path for c in result.changes],
+        pre_metric=outcome.pre_metric,
+        post_metric=outcome.post_metric,
+        directive_content=directive.content,
+        failure_detail=None,
+        layer="product",
+    )
+    if mem is not None and mem.completed % cfg.memory.pattern_refresh_every == 0:
+        mem_module.refresh_patterns(cfg.memory_dir, kg=kg)
+
+    try:
+        vision_mod.evolve_vision(kg, cfg, completed_directive_id=directive.id)
+    except Exception as e:
+        console.print(f"[dim yellow]Vision evolution failed: {e}[/dim yellow]")
+
+    console.rule(f"[bold green]Product cycle complete: {outcome.status.value}[/bold green]")
+    return outcome
+
+================================================================================
+FILE: templates/metaharness.toml
+================================================================================# ─────────────────────────────────────────────
+#  Meta-Harness Configuration
+#  Drop this file in your project root.
+#  Run `metaharness init` to scaffold it.
+# ─────────────────────────────────────────────
+
+[project]
+name = "my-project"
+description = """
+Describe what this project does and what success looks like.
+The diagnoser and proposer use this as their north star.
+Example: 'A FastAPI service that classifies user intent from chat messages.
+         Success = high accuracy on held-out evals, low latency, clean code.'
+"""
+
+[run]
+# Command to start / restart the project after a change is applied.
+# Use "none" if your project doesn't need restarting (e.g. a library).
+command = "python main.py"
+working_dir = "."
+# Seconds to wait after restart before collecting post-change evidence
+settle_seconds = 10
+
+[test]
+# Command to validate changes before they are applied.
+# Must exit 0 on success.
+command = "pytest"
+working_dir = "."
+timeout_seconds = 120
+# Append --junitxml to .metaharness/test_results.xml for structured evidence
+junit_xml = true
+
+[evidence]
+# Glob patterns (relative to project root) for runtime logs
+log_patterns = [
+  "logs/*.log",
+  "*.log",
+]
+# Glob patterns for structured metrics (JSON files with scalar values)
+metrics_patterns = [
+  "metrics/*.json",
+  "metrics.json",
+]
+# Only consider evidence files modified within this window
+max_age_hours = 24
+# How many recent log lines to feed into diagnosis (keeps context manageable)
+max_log_lines = 500
+
+[scope]
+# Glob patterns the agent IS allowed to modify.
+# Be explicit — the agent will only touch files matching these.
+modifiable = [
+  "src/**/*.py",
+  "*.py",
+  "config/**/*.yaml",
+  "config/**/*.toml",
+  "prompts/**/*.txt",
+  "prompts/**/*.md",
+  "tests/**/*.py",
+]
+# Always protected — agent will never touch these regardless of scope
+protected = [
+  "metaharness.toml",
+  ".git/**",
+  "pyproject.toml",
+  "setup.py",
+]
+
+[cycle]
+# Option A: fixed interval between cycles (seconds). 0 = not used unless schedule is empty.
+# interval_seconds = 3600
+
+# Option B: scheduled run times, 24h local clock (HH:MM). When non-empty, `metaharness daemon` ignores interval_seconds.
+# schedule = ["07:00", "12:00", "17:00", "22:00"]
+
+# Manual / single-shot: leave both unset (interval_seconds = 0 and no schedule) and use `metaharness run --once`.
+interval_seconds = 0
+# Human veto window in seconds. Delete .metaharness/PENDING_VETO to abort.
+veto_seconds = 120
+# Minimum evidence sessions collected before proposing changes
+min_evidence_items = 1
+# Max directives to store in history
+max_directive_history = 50
+
+# Optional: after failed tests or metric regression, restore agent-touched paths to HEAD (requires git).
+# rollback_enabled = false
+# rollback_on_test_failure = true
+# rollback_on_metric_regression = true
+# rollback_require_git = true
+
+[cursor]
+# Cursor Agent CLI binary (install: https://cursor.com/install — then `agent` on PATH).
+# On Windows, set to the full path of agent.cmd if `agent` is not found.
+agent_bin = "agent"
+# Model id for ANALYZE, diagnose (--mode=plan), EXECUTE JSON, and proposer (--yolo) — run `agent models`.
+model = "composer-2"
+# Optional; not used by the harness today (structured phases use ``model`` for JSON compliance).
+model_fast = "composer-2-fast"
+# Base timeout (seconds) per LLM call; OBSERVE/PLAN/EXECUTE use multiples of this.
+timeout_seconds = 1200
+
+[memory]
+# Set to false to disable the memory system entirely
+enabled = true
+# Re-infer learned patterns every N completed cycles
+pattern_refresh_every = 3
+
+[goals]
+# What does improvement look like for this project?
+# Free-form strings — used to guide the proposer when writing directives.
+objectives = [
+  "Improve correctness and test coverage",
+  "Reduce complexity and technical debt",
+  "Improve performance and efficiency",
+]
+# Optional: name of a scalar metric in your metrics JSON files
+# If set, cycle delta is measured against this metric
+primary_metric = ""
+optimization_direction = "maximize"  # "maximize" or "minimize"
+
+# ── Vision & product agent (optional) ──────────────────────────────────────────
+# When [product] enabled = true, `metaharness daemon` can run a second loop that
+# proposes new features from [vision]. Maintenance cycles use [cycle] / [maintenance].
+
+[vision]
+statement = """
+Describe the end state of this project (product agent uses this as north star).
+"""
+target_users = ""
+core_value = ""
+north_star_metric = ""
+features_wanted = []
+features_done = []
+out_of_scope = []
+
+[product]
+enabled = false
+interval_seconds = 0
+schedule = []
+veto_seconds = 600
+slack_channel = ""
+modifiable = [
+  "**/*.py",
+  "**/*.md",
+  "**/*.html",
+  "**/*.css",
+  "**/*.js",
+  "**/*.yaml",
+  "**/*.toml",
+]
+protected = []
+
+# ── Slack (optional, per-project app) ─────────────────────────────────────────
+# Create a Slack app for THIS project, install to workspace, enable Socket Mode.
+# Tokens via env (recommended): SLACK_BOT_TOKEN=xoxb-...  SLACK_APP_TOKEN=xapp-...
+# Register slash command /metaharness — no Request URL needed for Socket Mode.
+# Invite the bot to your channel.
+[slack]
+# Set enabled = true and configure tokens to activate Slack integration.
+enabled = false
+bot_token_env = "SLACK_BOT_TOKEN"
+app_token_env = "SLACK_APP_TOKEN"
+channel = "#meta-harness"
+slash_command = "metaharness"
+socket_mode = true
+socket_autostart_with_daemon = true
+post_veto_window = true
+post_cycle_result = true
+# Short Slack ping when a paper is queued for implementation (CLI or slash command).
+notify_research_queue = true
+

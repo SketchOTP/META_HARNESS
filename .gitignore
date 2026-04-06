@@ -1,0 +1,16 @@
+.metaharness/
+__pycache__/
+.pytest_cache/
+meta_harness.egg-info/
+.coverage
+coverage.xml
+.env
+
+# Local IDE / agent state (not portable)
+.cursor/
+
+# Scratch / one-off build artifacts
+unused
+_mcp_push_payload.json
+_tiny_push.json
+_build_mcp_push_payload.py

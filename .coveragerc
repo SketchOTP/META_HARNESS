@@ -1,0 +1,18 @@
+# Accurate coverage for the flat `meta_harness` layout:
+#   pytest tests/ --cov=. --cov-config=.coveragerc --cov-report=xml:coverage.xml
+# `pytest --cov=meta_harness` can report 0% because pytest-cov imports the
+# package before tracing; `coverage run -m pytest` also works.
+
+[run]
+branch = true
+source = .
+omit =
+    tests/*
+    */tests/*
+    scripts/*
+
+[report]
+omit =
+    tests/*
+    */tests/*
+    scripts/*

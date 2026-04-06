@@ -1,0 +1,21 @@
+## Learned User Preferences
+
+- Prefer a single-layer Meta-Harness design to keep debugging manageable; Slack integration should be project-specific (credentials and behavior) and grow to offer richer controls per deployment.
+- Keep documentation aligned with reality: agent work runs through the Cursor CLI (e.g. composer-2), not Claude or LM Studio.
+- Maintain `docs/PROJECT_OVERVIEW.md` as a living log and add a dated entry when substantive codebase changes ship.
+- Intend to reuse Meta-Harness across many projects so each codebase can evolve on its own with clear goals, including attention to token-efficient operation and scoping agent file context to directive-relevant and modifiable paths when the harness supports it.
+
+## Learned Workspace Facts
+
+- This repo primarily ships the reusable `meta_harness` package; some directives describe files or branches that live in other repositories and must be executed in those codebases (not here).
+- Self-hosting this repo uses root `metaharness.toml`, `scripts/generate_metrics.py`, and `scripts/run_cycle.bat` / `scripts/run_cycle.sh` (pytest with `--cov=. --cov-config=.coveragerc` so `coverage.xml` matches the flat layout per `coverage_policy`); pytest junit XML plus coverage feeds `metrics.json`, and the default knowledge graph path is `.metaharness/knowledge_graph.db`.
+- The workspace uses a flat Python layout (modules at repo root alongside the `meta_harness` package), which affects scope globs and paths in harness configuration; pytest does not treat `tests` as a package, so shared test helpers should be imported from `conftest` (not `tests.conftest`). In `memory.infer_patterns`, a COMPLETED directive counts as a win without requiring a positive metric delta, and extension-level success/failure patterns need at least three samples before they are emitted.
+- Structured phases that must parse model output (analyze, plan, diagnose) should ask for one markdown code block labeled json and parse its contents; composer-2 via the Cursor CLI often returns markdown prose instead of raw JSON-only replies.
+- Knowledge graph state reflects harness cycle outcomes; work landed outside those cycles is not automatically visible there, which can cause repeat proposals until the graph is updated or a sync path exists. `metaharness sync` warns and skips when a non-synced daemon cycle JSON for the same directive or a KG node already marked COMPLETED exists; pass `--force` to write anyway.
+- On Windows, capture Cursor CLI subprocess output as UTF-8 with replacement on decode errors so stdout outside the legacy ANSI code page does not break parsing.
+- Cursor CLI `agent` subprocesses should include `--trust` alongside existing flags so non-interactive runs are not blocked by workspace trust prompts (especially on Windows/CI).
+- In pytest, mock `cursor_client.json_call` / `agent_call` (and similar) on the same submodule object the code under test binds (for example `meta_harness.diagnoser.cursor_client.json_call`); patching a different import path can leave the real CLI running. For Slack helpers, patch the module path callers resolve (for example `meta_harness.slack_integration.socket_tokens_ready`), not a local alias like `si`.
+- `MetricsBundle` stores scalar metric values in `.current`; read primary metrics from `ev.metrics.current[...]` (or equivalent), not dict-style access on the bundle itself.
+- Slack Bolt interactive handlers must call `ack()` immediately before slow work; Slack times out in a few seconds if acknowledgment is delayed. Bolt only injects params it recognises — handlers that don't use `body` or `client` must drop those from their signatures entirely.
+- `pyproject.toml` is protected scope; agent-directed implementation directives must not modify it.
+- The harness daemon supports scheduled daily run times via a `schedule: list[str]` field in `metaharness.toml` (e.g. `["08:00", "20:00"]`), managed by `daemon.py` — replacing fixed-interval polling when a schedule is configured. With `catch_up` left at the default `false` on `[cycle]` and `[product]`, the first cycle waits for the next scheduled slot instead of running immediately on startup; set `catch_up = true` to restore the legacy immediate catch-up behavior.

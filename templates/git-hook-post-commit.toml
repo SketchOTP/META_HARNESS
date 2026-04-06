@@ -1,0 +1,13 @@
+# Example: run Git → knowledge graph sync after each local commit (optional).
+#
+# Copy the hook script idea into `.git/hooks/post-commit` (Unix) or use a Windows
+# equivalent that invokes the CLI from your repo root:
+#
+#   metaharness graph sync-git --dir /path/to/repo
+#
+# Requires: `metaharness` on PATH, `metaharness.toml` at the project root,
+# and a normal git worktree. Sync state lives in `.metaharness/knowledge_graph.db`
+# (cursor node `git_sync_cursor`), not under harness prompts.
+
+[example.post_commit]
+command = "metaharness graph sync-git --dir ."

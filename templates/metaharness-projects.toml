@@ -1,0 +1,22 @@
+# Meta-Harness multi-project registry
+# Place this file in a control-plane directory (the cwd or an ancestor when you run
+# `metaharness daemon`). Each [[projects]] root must contain its own metaharness.toml.
+#
+# See docs/MULTI_PROJECT.md for behavior, pause files, and product_project_id.
+
+# Optional: run the product-agent background thread only for this project id (must match
+# a [[projects]] id below). If omitted, the product thread is not started in multi-project mode.
+# product_project_id = "app-a"
+
+[[projects]]
+id = "app-a"
+# Path to a repo with metaharness.toml (relative to this file or absolute).
+root = "../path-to-repo-a"
+enabled = true
+label = "Primary app"
+
+[[projects]]
+id = "lib-b"
+root = "../path-to-repo-b"
+enabled = true
+label = "Shared library"

@@ -1,0 +1,170 @@
+# ─────────────────────────────────────────────
+#  Meta-Harness Configuration
+#  Drop this file in your project root.
+#  Run `metaharness init` to scaffold it.
+# ─────────────────────────────────────────────
+
+[project]
+name = "my-project"
+description = """
+Describe what this project does and what success looks like.
+The diagnoser and proposer use this as their north star.
+Example: 'A FastAPI service that classifies user intent from chat messages.
+         Success = high accuracy on held-out evals, low latency, clean code.'
+"""
+
+[run]
+# Command to start / restart the project after a change is applied.
+# Use "none" if your project doesn't need restarting (e.g. a library).
+command = "python main.py"
+working_dir = "."
+# Seconds to wait after restart before collecting post-change evidence
+settle_seconds = 10
+
+[test]
+# Command to validate changes before they are applied.
+# Must exit 0 on success.
+command = "pytest"
+working_dir = "."
+timeout_seconds = 120
+# Append --junitxml to .metaharness/test_results.xml for structured evidence
+junit_xml = true
+
+[evidence]
+# Glob patterns (relative to project root) for runtime logs
+log_patterns = [
+  "logs/*.log",
+  "*.log",
+]
+# Glob patterns for structured metrics (JSON files with scalar values)
+metrics_patterns = [
+  "metrics/*.json",
+  "metrics.json",
+]
+# Only consider evidence files modified within this window
+max_age_hours = 24
+# How many recent log lines to feed into diagnosis (keeps context manageable)
+max_log_lines = 500
+
+[scope]
+# Glob patterns the agent IS allowed to modify.
+# Be explicit — the agent will only touch files matching these.
+modifiable = [
+  "src/**/*.py",
+  "*.py",
+  "config/**/*.yaml",
+  "config/**/*.toml",
+  "prompts/**/*.txt",
+  "prompts/**/*.md",
+  "tests/**/*.py",
+]
+# Always protected — agent will never touch these regardless of scope
+protected = [
+  "metaharness.toml",
+  ".git/**",
+  "pyproject.toml",
+  "setup.py",
+]
+
+[cycle]
+# Option A: fixed interval between cycles (seconds). 0 = not used unless schedule is empty.
+# interval_seconds = 3600
+
+# Option B: scheduled run times, 24h local clock (HH:MM). When non-empty, `metaharness daemon` ignores interval_seconds.
+# schedule = ["07:00", "12:00", "17:00", "22:00"]
+
+# Manual / single-shot: leave both unset (interval_seconds = 0 and no schedule) and use `metaharness run --once`.
+interval_seconds = 0
+# Human veto window in seconds. Delete .metaharness/PENDING_VETO to abort.
+veto_seconds = 120
+# Minimum evidence sessions collected before proposing changes
+min_evidence_items = 1
+# Max directives to store in history
+max_directive_history = 50
+
+# Optional: after failed tests or metric regression, restore agent-touched paths to HEAD (requires git).
+# rollback_enabled = false
+# rollback_on_test_failure = true
+# rollback_on_metric_regression = true
+# rollback_require_git = true
+
+[cursor]
+# Cursor Agent CLI binary (install: https://cursor.com/install — then `agent` on PATH).
+# On Windows, set to the full path of agent.cmd if `agent` is not found.
+agent_bin = "agent"
+# Model id for ANALYZE, diagnose (--mode=plan), EXECUTE JSON, and proposer (--yolo) — run `agent models`.
+model = "composer-2"
+# Optional; not used by the harness today (structured phases use ``model`` for JSON compliance).
+model_fast = "composer-2-fast"
+# Base timeout (seconds) per LLM call; OBSERVE/PLAN/EXECUTE use multiples of this.
+timeout_seconds = 1200
+
+[memory]
+# Set to false to disable the memory system entirely
+enabled = true
+# Re-infer learned patterns every N completed cycles
+pattern_refresh_every = 3
+
+[goals]
+# What does improvement look like for this project?
+# Free-form strings — used to guide the proposer when writing directives.
+objectives = [
+  "Improve correctness and test coverage",
+  "Reduce complexity and technical debt",
+  "Improve performance and efficiency",
+]
+# Optional: name of a scalar metric in your metrics JSON files
+# If set, cycle delta is measured against this metric
+primary_metric = ""
+optimization_direction = "maximize"  # "maximize" or "minimize"
+
+# ── Vision & product agent (optional) ──────────────────────────────────────────
+# When [product] enabled = true, `metaharness daemon` can run a second loop that
+# proposes new features from [vision]. Maintenance cycles use [cycle] / [maintenance].
+
+[vision]
+statement = """
+Describe the end state of this project (product agent uses this as north star).
+"""
+target_users = ""
+core_value = ""
+north_star_metric = ""
+features_wanted = []
+features_done = []
+out_of_scope = []
+
+[product]
+enabled = false
+interval_seconds = 0
+schedule = []
+veto_seconds = 600
+slack_channel = ""
+modifiable = [
+  "**/*.py",
+  "**/*.md",
+  "**/*.html",
+  "**/*.css",
+  "**/*.js",
+  "**/*.yaml",
+  "**/*.toml",
+]
+protected = []
+
+# ── Slack (optional, per-project app) ─────────────────────────────────────────
+# Create a Slack app for THIS project, install to workspace, enable Socket Mode.
+# Tokens via env (recommended): SLACK_BOT_TOKEN=xoxb-...  SLACK_APP_TOKEN=xapp-...
+# Register slash command /metaharness — no Request URL needed for Socket Mode.
+# Invite the bot to your channel.
+[slack]
+# Set enabled = true and configure tokens to activate Slack integration.
+enabled = false
+bot_token_env = "SLACK_BOT_TOKEN"
+app_token_env = "SLACK_APP_TOKEN"
+channel = "#meta-harness"
+slash_command = "metaharness"
+socket_mode = true
+socket_autostart_with_daemon = true
+post_veto_window = true
+post_cycle_result = true
+# Short Slack ping when enqueue succeeds (same code path for `metaharness research eval` and `/metaharness research <url>`).
+notify_research_queue = true

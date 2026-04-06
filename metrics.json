@@ -1,0 +1,11 @@
+{
+  "test_pass_rate": 1.0,
+  "test_count": 441,
+  "test_passed": 439,
+  "test_failed": 0,
+  "test_skipped": 2,
+  "test_duration_s": 16.78,
+  "coverage_pct": 33.0,
+  "branch_coverage_pct": 24.78,
+  "low_coverage_files": []
+}

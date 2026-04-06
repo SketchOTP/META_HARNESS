@@ -1,0 +1,175 @@
+[project]
+name = "meta-harness"
+description = """
+A portable self-improving outer loop for any Python project.
+The harness diagnoses its own codebase, proposes targeted improvements via
+the Cursor CLI (model=composer-2), implements them through a 3-phase sequential
+agent (Observe -> Plan -> Execute), runs its own test suite, and tracks all
+outcomes in a SQLite knowledge graph.
+
+Success = high test pass rate, full coverage of all modules, clean architecture,
+clear documentation, and directives that reliably improve the codebase rather
+than introducing regressions.
+
+The harness should be able to improve its own evidence collection, memory
+system, knowledge graph queries, agent prompts, and CLI -- but must never
+break the contract: run_cycle() and load_config() must always be importable
+and functional.
+"""
+
+[run]
+# The harness is a library -- no process to restart after a change.
+# Reinstall in editable mode so imports reflect the new code immediately.
+command = "pip install -e . --quiet"
+working_dir = "."
+settle_seconds = 3
+
+[test]
+# Run full suite with junit XML and coverage.
+# generate_metrics.py reads these outputs and writes metrics.json.
+command = "pytest tests/ --junitxml=.metaharness/test_results.xml --cov=meta_harness --cov-report=xml:coverage.xml --cov-report=term-missing -q"
+working_dir = "."
+timeout_seconds = 180
+junit_xml = false  # cycle.py must NOT append --junitxml again; it's already in the command
+
+[cursor]
+model       = "composer-2"
+model_fast  = "composer-2-fast"
+agent_timeout = 600
+json_timeout  = 300
+json_retries  = 2
+max_files_per_cycle = 30   # ANALYZE relevance filter cap; 0 = unlimited
+
+[evidence]
+log_patterns     = []           # No runtime logs -- harness is a library
+metrics_patterns = ["metrics.json"]
+max_age_hours    = 168          # 7 days -- metrics persist between runs
+max_log_lines    = 200
+
+collect_ast       = true
+collect_git_depth = true
+collect_coverage  = true
+collect_deps      = true
+
+[scope]
+# Flat package layout: importable modules live at repo root as meta_harness.
+modifiable = [
+  "*.py",
+  "tests/*.py",
+  "tests/conftest.py",
+  "README.md",
+  "docs/*.md",
+]
+
+# Protected: the config that controls the harness itself, packaging, and git.
+# Also protect pyproject.toml to avoid the harness breaking its own install.
+protected = [
+  "metaharness.toml",
+  "pyproject.toml",
+  "setup.py",
+  "setup.cfg",
+  ".git/**",
+  "scripts/**",             # metric generation scripts are infrastructure
+  ".metaharness/**",        # harness runtime state
+]
+
+[cycle]
+# Daemon: use schedule (local HH:MM) or interval_seconds > 0 -- not both needed; interval is ignored when schedule is set.
+interval_seconds    = 0       # ignored when schedule is non-empty
+schedule            = ["07:00", "12:00", "17:00", "22:00"]
+veto_seconds        = 300     # 5 minutes -- give yourself time to read the directive
+min_evidence_items  = 2       # Need at least metrics + test results before proposing
+max_directive_history = 100
+
+[memory]
+enabled               = true
+backend               = "graph"
+pattern_refresh_every = 3
+max_context_nodes     = 20
+
+[goals]
+objectives = [
+  "Find and fix bugs, regressions, and edge cases in existing code",
+  "Improve robustness and error handling across all modules",
+  "Harden platform-specific and subprocess code paths",
+]
+primary_metric         = "test_pass_rate"
+optimization_direction = "maximize"
+
+[slack]
+enabled = true
+bot_token_env = "SLACK_BOT_TOKEN"
+app_token_env = "SLACK_APP_TOKEN"
+# Channel ID (C...) or name (#my-channel) -- bot must be a member
+channel = "C0ARQTQ52JC"
+slash_command = "metaharness"
+socket_mode = true
+socket_autostart_with_daemon = true
+post_veto_window = true
+post_cycle_result = true
+
+
+[vision]
+statement = """
+Meta-Harness is a portable, self-improving development system that any project
+can adopt. It diagnoses its own codebase, proposes targeted improvements, and
+implements them autonomously via the Cursor CLI. The end goal is a fully
+autonomous development partner -- one that maintains code health, builds new
+features toward a stated vision, evaluates research papers for implementation,
+and operates continuously with minimal human input beyond approval of major
+changes.
+"""
+target_users      = "Developers and AI researchers who want autonomous code evolution"
+core_value        = "A project that improves itself while you focus on what matters"
+north_star_metric = "coverage_pct"
+
+features_wanted = [
+  "Multi-project management from single daemon",
+  "Git-based KG sync so human commits are visible to agents",
+  "Automatic rollback when test_pass_rate drops",
+  "Agent confidence scoring -- directives rated by predicted success likelihood",
+  "Cross-project memory -- patterns learned on one project applied to others",
+  "Natural language project setup -- describe in plain English, harness configures itself",
+  "Slack notifications when research queue items are ready for implementation",
+  "Dashboard auto-refresh without full page reload",
+]
+
+features_done = [
+  "Single-layer maintenance cycle",
+  "SQLite knowledge graph with causal chain traversal and FTS5 search",
+  "Slack integration with Block Kit veto buttons and Socket Mode",
+  "Scheduled daemon with pause/resume and DAEMON_PAUSE file support",
+  "Deep evidence collection -- AST, git, coverage, pytest XML",
+  "Sequential agent via Cursor CLI yolo mode",
+  "Two-layer architecture -- maintenance + product agents on separate schedules",
+  "Slash commands -- status, memory, memmap, pause, resume, veto, proceed, product, research",
+  "Research paper ingestion via Slack URL and CLI (arxiv, PDF, HTML fallback)",
+  "Research queue with automatic product agent context injection",
+  "Web dashboard for cycle history, metrics, KG snapshot, and memmap (port 8765)",
+  "metaharness sync command for ingesting human-issued directives into KG and memory",
+  "Agent mutex preventing concurrent implementations via filelock",
+  "Full test suite -- 363 tests passing",
+]
+
+out_of_scope = [
+  "Replacing human architectural decisions",
+  "Running without operator veto capability",
+  "Direct database or production system access",
+  "Training or fine-tuning language models",
+  "Implementing attention or neural architectures",
+  "Firebase or cloud scraping services",
+  "Coverage increases and test additions -- maintenance agent handles this",
+  "Bug fixes and stability work -- maintenance agent handles this",
+]
+
+[product]
+enabled      = true
+schedule     = ["08:00"]
+veto_seconds = 600
+slack_channel = ""
+modifiable = [
+  "*.py",
+  "tests/*.py",
+  "docs/*.md",
+  "templates/*.toml",
+]
