@@ -19,6 +19,105 @@ from typing import Any, Optional
 from .config import HarnessConfig
 
 
+def _cap_tail_lines(text: str, max_lines: int) -> str:
+    if max_lines <= 0 or not text.strip():
+        return text
+    lines = text.splitlines()
+    if len(lines) <= max_lines:
+        return text
+    return "\n".join(lines[-max_lines:])
+
+
+def _cap_tail_chars(text: str, max_chars: int) -> str:
+    if max_chars <= 0 or not text:
+        return text
+    if len(text) <= max_chars:
+        return text
+    return text[-max_chars:]
+
+
+def _cap_head_lines(text: str, max_lines: int) -> str:
+    if max_lines <= 0 or not text.strip():
+        return text
+    lines = text.splitlines()
+    if len(lines) <= max_lines:
+        return text
+    return "\n".join(lines[:max_lines])
+
+
+def format_evidence_for_diagnosis(cfg: HarnessConfig, ev: Evidence) -> dict[str, str]:
+    """
+    Build bounded, structured sections for LLM diagnosis prompts (token control).
+    Keys are stable markdown section titles; values are body text (no outer fences).
+    """
+    ec = cfg.evidence
+    out: dict[str, str] = {}
+
+    if ev.metrics.current:
+        if ec.metrics_json_compact:
+            out["Metrics"] = json.dumps(ev.metrics.current, separators=(",", ":"))
+        else:
+            pretty = json.dumps(ev.metrics.current, indent=2)
+            out["Metrics"] = _cap_tail_chars(pretty, min(ec.max_git_diff_chars, 16000))
+
+    if ev.metrics.anomalies:
+        lines = "\n".join(ev.metrics.anomalies[:20])
+        out["Metric anomalies"] = _cap_tail_chars(lines, ec.max_git_diff_chars)
+
+    if ev.tests.passed or ev.tests.failed or ev.test_results.strip():
+        lines = [f"passed={ev.tests.passed} failed={ev.tests.failed}"]
+        if ev.tests.failed_names:
+            lines.append("failed_names: " + ", ".join(ev.tests.failed_names[:30]))
+        tail = _cap_tail_chars(ev.test_results.strip(), ec.max_test_output_chars)
+        if tail:
+            lines.append("--- tail ---")
+            lines.append(tail)
+        out["Tests"] = "\n".join(lines)
+
+    if ev.error_patterns:
+        lines = "\n".join(
+            f"- {p['pattern']} (×{p['count']})" for p in ev.error_patterns[:15]
+        )
+        out["Error patterns"] = lines
+
+    if ev.log_tail.strip():
+        lt = _cap_tail_lines(ev.log_tail, ec.max_log_lines_diagnose)
+        lt = _cap_tail_chars(lt, ec.max_log_chars_diagnose)
+        out["Runtime logs"] = lt
+
+    if ev.cursor_cli_failure_excerpt.strip():
+        out["Last Cursor / Agent CLI failure"] = _cap_tail_chars(
+            ev.cursor_cli_failure_excerpt.strip(), ec.max_cursor_failure_chars
+        )
+
+    if ev.git_diff.strip():
+        out["Recent changes"] = _cap_tail_chars(ev.git_diff.strip(), ec.max_git_diff_chars)
+
+    if ev.cycle_history.strip():
+        ch = _cap_head_lines(ev.cycle_history, ec.max_cycle_history_lines)
+        out["Previous cycle history"] = _cap_tail_chars(ch, ec.max_cycle_history_chars)
+
+    if ev.file_tree.strip():
+        ft = _cap_head_lines(ev.file_tree, ec.max_file_tree_lines)
+        out["Project file tree"] = _cap_tail_chars(ft, ec.max_file_tree_chars)
+
+    if ev.ast.syntax_errors:
+        out["AST syntax errors"] = "\n".join(ev.ast.syntax_errors[:20])
+    if ev.ast.long_functions:
+        out["Long functions"] = "\n".join(ev.ast.long_functions[:20])
+    fn_preview = ", ".join(ev.ast.functions[:30])
+    if fn_preview:
+        out["Functions (sample)"] = fn_preview
+    cls_preview = ", ".join(ev.ast.classes[:30])
+    if cls_preview:
+        out["Classes (sample)"] = cls_preview
+
+    if ev.deps.packages:
+        out["Dependencies"] = "\n".join(ev.deps.packages[:50])
+
+    return out
+
+
 @dataclass
 class MetricsBundle:
     current: dict[str, float] = field(default_factory=dict)
@@ -229,14 +328,15 @@ def _file_tree(root: Path, modifiable_patterns: list[str], protected: list[str])
     return "\n".join(lines[:200])
 
 
-def _cycle_history(cfg: HarnessConfig, n: int = 5) -> str:
+def _cycle_history(cfg: HarnessConfig) -> str:
     logs: list[Path] = []
     for d in (cfg.maintenance_cycles_dir, cfg.cycles_dir):
         if d.is_dir():
             logs.extend(d.glob("*.json"))
     logs = sorted(logs, key=lambda p: p.stat().st_mtime, reverse=True)
+    n_files = max(1, cfg.evidence.max_cycle_history_files)
     lines = []
-    for log in logs[:n]:
+    for log in logs[:n_files]:
         try:
             data = json.loads(log.read_text(encoding="utf-8"))
             ts = data.get("timestamp", "?")
@@ -369,7 +469,8 @@ def _collect_tests(cfg: HarnessConfig, ev: Evidence) -> None:
     if out_path.exists():
         try:
             raw = out_path.read_text(encoding="utf-8", errors="replace")
-            ev.test_results = raw[-5000:]
+            cap = cfg.evidence.max_test_output_chars
+            ev.test_results = raw[-cap:] if cap > 0 else raw
             if _pytest_log_indicates_incomplete_run(raw):
                 ev.tests = TestEvidence(passed=0, failed=1, failed_names=["collection"])
             elif ev.tests.passed == 0 and ev.tests.failed == 0:
@@ -406,7 +507,9 @@ def collect(cfg: HarnessConfig) -> Evidence:
     test_results = ""
     if test_result_path.exists():
         try:
-            test_results = test_result_path.read_text(errors="replace")[-5000:]
+            raw_tr = test_result_path.read_text(errors="replace")
+            cap = cfg.evidence.max_test_output_chars
+            test_results = raw_tr[-cap:] if cap > 0 else raw_tr
         except OSError:
             pass
 

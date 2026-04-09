@@ -511,7 +511,8 @@ def memory(target_dir: str, reset: bool):
         return
 
     mem = mem_module.load(cfg.memory_dir)
-    ctx = mem_module.compact_context(mem)
+    kg = mem_module.get_kg(cfg)
+    ctx = mem_module.compact_context(mem, cfg=cfg, kg=kg)
     if not ctx:
         console.print("[dim]No memory yet.[/dim]")
     else:

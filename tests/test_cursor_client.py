@@ -11,7 +11,6 @@ import pytest
 
 from meta_harness.config import HarnessConfig
 from meta_harness import cursor_client
-from meta_harness.platform_runtime import CursorAgentBinaryNotFound
 
 
 def _cfg(tmp_path: Path) -> HarnessConfig:
@@ -860,11 +859,14 @@ def test_resolve_agent_executable_suffix_fallback_when_agent_not_on_path(tmp_pat
 
 
 def test_resolve_agent_executable_raises_when_not_found():
+    """Use ``platform_runtime.CursorAgentBinaryNotFound`` from a fresh import — CLI tests may reload submodules."""
+    import meta_harness.platform_runtime as pr
+
     def _which(_name: str):
         return None
 
     with patch("meta_harness.platform_runtime.shutil.which", side_effect=_which):
-        with pytest.raises(CursorAgentBinaryNotFound):
+        with pytest.raises(pr.CursorAgentBinaryNotFound):
             cursor_client._resolve_agent_executable("agent")
 
 

@@ -163,7 +163,7 @@ def test_build_prompt_includes_cursor_cli_failure_excerpt(tmp_path: Path):
     ex = "exit_code: 1\nstderr: boom\n"
     ev = Evidence(cursor_cli_failure_excerpt=ex)
     prompt = _build_prompt(cfg, ev, kg=None)
-    assert "Last Cursor / Agent CLI failure (most recent)" in prompt
+    assert "### Last Cursor / Agent CLI failure" in prompt
     assert "boom" in prompt
 
 

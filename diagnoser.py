@@ -4,7 +4,6 @@ Feeds collected evidence to Cursor Agent (Composer) and produces a structured Di
 """
 from __future__ import annotations
 
-import json
 import os
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Optional
@@ -13,6 +12,7 @@ from rich.console import Console
 
 from . import cursor_client
 from .config import HarnessConfig
+from . import evidence
 from .evidence import Evidence
 from . import memory as mem_module
 from .knowledge_graph import build_cross_layer_context
@@ -72,7 +72,7 @@ def _build_prompt(cfg: HarnessConfig, ev: Evidence, kg: Optional["KnowledgeGraph
 
     if cfg.memory.enabled:
         mem = mem_module.load(cfg.memory_dir)
-        ctx = mem_module.compact_context(mem, kg=kg)
+        ctx = mem_module.compact_context(mem, cfg=cfg, kg=kg, evidence=ev)
         if ctx:
             parts.append(f"## Harness Memory\n```\n{ctx}\n```\n")
 
@@ -86,32 +86,33 @@ def _build_prompt(cfg: HarnessConfig, ev: Evidence, kg: Optional["KnowledgeGraph
         f"Collected at: {ev.collected_at}",
     ]
 
-    if ev.metrics.current:
-        parts.append(
-            "\n### Metrics\n```json\n" + json.dumps(ev.metrics.current, indent=2) + "\n```"
-        )
-
-    if ev.test_results.strip():
-        parts.append(f"\n### Last Test Results\n```\n{ev.test_results.strip()[:3000]}\n```")
-
-    if ev.log_tail.strip():
-        parts.append(f"\n### Runtime Logs\n```\n{ev.log_tail.strip()}\n```")
-
-    if ev.cursor_cli_failure_excerpt.strip():
-        parts.append(
-            "\n### Last Cursor / Agent CLI failure (most recent)\n```\n"
-            + ev.cursor_cli_failure_excerpt.strip()
-            + "\n```"
-        )
-
-    if ev.git_diff.strip():
-        parts.append(f"\n### Recent Changes\n```\n{ev.git_diff.strip()}\n```")
-
-    if ev.cycle_history.strip():
-        parts.append(f"\n### Previous Cycle History\n```\n{ev.cycle_history.strip()}\n```")
-
-    if ev.file_tree.strip():
-        parts.append(f"\n### Project File Tree\n```\n{ev.file_tree.strip()}\n```")
+    sections = evidence.format_evidence_for_diagnosis(cfg, ev)
+    priority = [
+        "Metrics",
+        "Metric anomalies",
+        "Tests",
+        "Error patterns",
+        "Runtime logs",
+        "Last Cursor / Agent CLI failure",
+        "Recent changes",
+        "Previous cycle history",
+        "Project file tree",
+        "AST syntax errors",
+        "Long functions",
+        "Functions (sample)",
+        "Classes (sample)",
+        "Dependencies",
+    ]
+    seen = set()
+    for title in priority:
+        body = sections.get(title)
+        if body and body.strip():
+            parts.append(f"\n### {title}\n```\n{body.strip()}\n```")
+            seen.add(title)
+    for title, body in sections.items():
+        if title in seen or not (body and body.strip()):
+            continue
+        parts.append(f"\n### {title}\n```\n{body.strip()}\n```")
 
     parts.append(
         "\nPrimary metric: "
