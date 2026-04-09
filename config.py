@@ -54,6 +54,18 @@ class EvidenceConfig:
     metrics_patterns: list[str] = field(default_factory=lambda: ["metrics.json"])
     max_age_hours: int = 24
     max_log_lines: int = 500
+    # Character / line budgets for diagnosis-style prompts (collect() may use higher raw read sizes).
+    max_test_output_chars: int = 4000
+    max_log_lines_diagnose: int = 120
+    max_log_chars_diagnose: int = 12000
+    max_git_diff_chars: int = 8000
+    max_cycle_history_files: int = 12
+    max_cycle_history_lines: int = 12
+    max_cycle_history_chars: int = 4000
+    max_file_tree_lines: int = 120
+    max_file_tree_chars: int = 6000
+    max_cursor_failure_chars: int = 4000
+    metrics_json_compact: bool = True
 
 
 @dataclass
@@ -155,6 +167,12 @@ class MemoryConfig:
     enabled: bool = True
     # Refresh inferred patterns every N completed cycles
     pattern_refresh_every: int = 3
+    compact_n_wins: int = 3
+    compact_n_miss: int = 2
+    kg_max_directives: int = 8
+    kg_use_query_context: bool = True
+    kg_query_max_chars: int = 900
+    kg_query_max_directives: int = 6
 
 
 @dataclass
@@ -162,6 +180,21 @@ class GoalsConfig:
     objectives: list[str] = field(default_factory=list)
     primary_metric: str = ""
     optimization_direction: str = "maximize"
+
+
+@dataclass
+class EmbeddingConfig:
+    """Optional semantic recall: index directive text + retrieve similar chunks."""
+
+    enabled: bool = False
+    provider: str = "openai"  # openai | local
+    model: str = "text-embedding-3-small"
+    base_url: str = ""
+    api_key_env: str = "OPENAI_API_KEY"
+    local_model_id: str = "all-MiniLM-L6-v2"
+    top_k: int = 4
+    max_chunk_chars: int = 1200
+    min_similarity: float = 0.25
 
 
 @dataclass
@@ -210,6 +243,7 @@ class HarnessConfig:
     vision: VisionConfig = field(default_factory=VisionConfig)
     cursor: CursorConfig = field(default_factory=CursorConfig)
     memory: MemoryConfig = field(default_factory=MemoryConfig)
+    embedding: EmbeddingConfig = field(default_factory=EmbeddingConfig)
     goals: GoalsConfig = field(default_factory=GoalsConfig)
     slack: SlackConfig = field(default_factory=SlackConfig)
 
@@ -245,6 +279,10 @@ class HarnessConfig:
     @property
     def memory_dir(self) -> Path:
         return self.harness_dir / "memory"
+
+    @property
+    def embedding_index_path(self) -> Path:
+        return self.memory_dir / "embedding_index.sqlite"
 
     @property
     def pending_veto_path(self) -> Path:
@@ -338,6 +376,8 @@ def load_config(project_root: Path) -> HarnessConfig:
     cu_raw = _section("cursor")
     go_raw = _section("goals")
     sl_raw = _section("slack")
+    mem_raw = _section("memory")
+    emb_raw = _section("embedding")
 
     def _schedule_list(src: dict) -> list[str]:
         sraw = src.get("schedule", [])
@@ -433,6 +473,17 @@ def load_config(project_root: Path) -> HarnessConfig:
             metrics_patterns=ev_raw.get("metrics_patterns", ["metrics.json"]),
             max_age_hours=ev_raw.get("max_age_hours", 24),
             max_log_lines=ev_raw.get("max_log_lines", 500),
+            max_test_output_chars=int(ev_raw.get("max_test_output_chars", 4000)),
+            max_log_lines_diagnose=int(ev_raw.get("max_log_lines_diagnose", 120)),
+            max_log_chars_diagnose=int(ev_raw.get("max_log_chars_diagnose", 12000)),
+            max_git_diff_chars=int(ev_raw.get("max_git_diff_chars", 8000)),
+            max_cycle_history_files=int(ev_raw.get("max_cycle_history_files", 12)),
+            max_cycle_history_lines=int(ev_raw.get("max_cycle_history_lines", 12)),
+            max_cycle_history_chars=int(ev_raw.get("max_cycle_history_chars", 4000)),
+            max_file_tree_lines=int(ev_raw.get("max_file_tree_lines", 120)),
+            max_file_tree_chars=int(ev_raw.get("max_file_tree_chars", 6000)),
+            max_cursor_failure_chars=int(ev_raw.get("max_cursor_failure_chars", 4000)),
+            metrics_json_compact=bool(ev_raw.get("metrics_json_compact", True)),
         ),
         scope=ScopeConfig(
             modifiable=sc_raw.get("modifiable", ["src/**/*.py", "*.py"]),
@@ -467,8 +518,27 @@ def load_config(project_root: Path) -> HarnessConfig:
             max_files_per_cycle=int(cu_raw.get("max_files_per_cycle", 0)),
         ),
         memory=MemoryConfig(
-            enabled=raw.get("memory", {}).get("enabled", True),
-            pattern_refresh_every=raw.get("memory", {}).get("pattern_refresh_every", 3),
+            enabled=mem_raw.get("enabled", True),
+            pattern_refresh_every=int(mem_raw.get("pattern_refresh_every", 3)),
+            compact_n_wins=int(mem_raw.get("compact_n_wins", 3)),
+            compact_n_miss=int(mem_raw.get("compact_n_miss", 2)),
+            kg_max_directives=int(mem_raw.get("kg_max_directives", 8)),
+            kg_use_query_context=bool(mem_raw.get("kg_use_query_context", True)),
+            kg_query_max_chars=int(mem_raw.get("kg_query_max_chars", 900)),
+            kg_query_max_directives=int(mem_raw.get("kg_query_max_directives", 6)),
+        ),
+        embedding=EmbeddingConfig(
+            enabled=bool(emb_raw.get("enabled", False)),
+            provider=str(emb_raw.get("provider", "openai") or "openai").strip().lower(),
+            model=str(emb_raw.get("model", "text-embedding-3-small") or "text-embedding-3-small"),
+            base_url=str(emb_raw.get("base_url", "") or "").strip(),
+            api_key_env=str(emb_raw.get("api_key_env", "OPENAI_API_KEY") or "OPENAI_API_KEY"),
+            local_model_id=str(
+                emb_raw.get("local_model_id", "all-MiniLM-L6-v2") or "all-MiniLM-L6-v2"
+            ),
+            top_k=int(emb_raw.get("top_k", 4)),
+            max_chunk_chars=int(emb_raw.get("max_chunk_chars", 1200)),
+            min_similarity=float(emb_raw.get("min_similarity", 0.25)),
         ),
         goals=GoalsConfig(
             objectives=go_raw.get("objectives", []),

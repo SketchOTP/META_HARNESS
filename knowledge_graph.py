@@ -453,7 +453,46 @@ class KnowledgeGraph:
 
         self._conn.commit()
 
-    def build_compact_context(self, *, max_directives: int = 8) -> str:
+    def _directive_one_liner(self, directive_id: str) -> str:
+        row = self._conn.execute(
+            "SELECT id, name, status FROM nodes WHERE node_type='directive' AND id = ?",
+            (directive_id,),
+        ).fetchone()
+        if not row:
+            return directive_id
+        title = (row["name"] or "").strip()
+        if len(title) > 48:
+            title = title[:45] + "…"
+        st = (row["status"] or "?")[:4]
+        return f"{row['id']} {st} {title}".strip()
+
+    def _fts_query_lines(self, query: str, *, limit: int) -> list[str]:
+        if not query.strip() or limit <= 0:
+            return []
+        hits = self.search(query.strip()[:500], limit=limit * 3)
+        out: list[str] = []
+        seen: set[str] = set()
+        for node_id in hits:
+            if not str(node_id).startswith("D") and not str(node_id).startswith("M") and not str(node_id).startswith("P"):
+                continue
+            if node_id in seen:
+                continue
+            seen.add(node_id)
+            line = self._directive_one_liner(str(node_id))
+            out.append(line)
+            if len(out) >= limit:
+                break
+        return out
+
+    def build_compact_context(
+        self,
+        *,
+        max_directives: int = 8,
+        evidence: Any = None,
+        kg_use_query_context: bool = True,
+        kg_query_max_chars: int = 900,
+        kg_query_max_directives: int = 6,
+    ) -> str:
         rows = self._conn.execute(
             """SELECT id, name, status FROM nodes WHERE node_type='directive'
                ORDER BY updated_at DESC LIMIT ?""",
@@ -477,8 +516,63 @@ class KnowledgeGraph:
                 wins.append(r["id"])
         if wins:
             lines.append("wins: " + " ".join(wins[:5]))
+
+        rel_lines: list[str] = []
+        win_ids = set(wins)
+        if kg_use_query_context and evidence is not None:
+            qparts: list[str] = []
+            try:
+                fn = getattr(evidence, "tests", None)
+                if fn is not None and getattr(fn, "failed_names", None):
+                    qparts.extend(str(x) for x in (fn.failed_names or [])[:8])
+            except Exception:
+                pass
+            for p in getattr(evidence, "error_patterns", None) or []:
+                if isinstance(p, dict) and p.get("pattern"):
+                    qparts.append(str(p["pattern"])[:120])
+            tr = getattr(evidence, "test_results", "") or ""
+            if tr.strip():
+                qparts.append(tr.strip()[-500:])
+            lt = getattr(evidence, "log_tail", "") or ""
+            if lt.strip():
+                qparts.append(lt.strip()[-400:])
+            q = " ".join(qparts).strip()[:900]
+            if q:
+                rel_lines = self._fts_query_lines(q, limit=kg_query_max_directives)
+            seen_rel = {x.split()[0] for x in rel_lines if x.split()}
+            for fp in (getattr(evidence, "git_recent_paths", None) or [])[:6]:
+                if not fp:
+                    continue
+                for edge in self.get_edges(dst_id=f"file:{fp}", relation="modified")[:2]:
+                    lid = edge.src_id
+                    if lid in win_ids or lid in seen_rel:
+                        continue
+                    line = self._directive_one_liner(lid)
+                    rel_lines.append(line)
+                    seen_rel.add(lid)
+                    if len(rel_lines) >= kg_query_max_directives:
+                        break
+                if len(rel_lines) >= kg_query_max_directives:
+                    break
+
+        if rel_lines:
+            filtered: list[str] = []
+            seen_ids = set(win_ids)
+            for ln in rel_lines:
+                pid = ln.split()[0] if ln.split() else ""
+                if pid and pid not in seen_ids:
+                    filtered.append(ln)
+                    seen_ids.add(pid)
+                if len(filtered) >= kg_query_max_directives:
+                    break
+            if filtered:
+                lines.append("rel: " + " | ".join(filtered))
+
         lines.append("]")
-        return "\n".join(lines)
+        block = "\n".join(lines)
+        if len(block) > kg_query_max_chars and kg_query_max_chars > 80:
+            return block[: kg_query_max_chars - 1] + "…"
+        return block
 
     def get_nodes_by_layer(self, layer: str, *, limit: int = 12) -> list[dict[str, Any]]:
         rows = self._conn.execute(

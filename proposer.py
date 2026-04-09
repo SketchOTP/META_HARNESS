@@ -78,7 +78,7 @@ def _build_prompt(cfg: HarnessConfig, diagnosis: Diagnosis, kg: Optional["Knowle
 
 ## Harness Memory
 ```
-{mem_module.compact_context(mem_module.load(cfg.memory_dir), kg=kg) if cfg.memory.enabled else '(disabled)'}
+{mem_module.compact_context(mem_module.load(cfg.memory_dir), cfg=cfg, kg=kg) if cfg.memory.enabled else '(disabled)'}
 ```
 
 ---

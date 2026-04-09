@@ -263,6 +263,35 @@ def test_build_compact_context_populated(kg: KnowledgeGraph):
     assert "wins:" in ctx
 
 
+def test_build_compact_context_rel_from_paths(kg: KnowledgeGraph):
+    from meta_harness.evidence import Evidence, TestEvidence
+
+    kg.ingest_cycle_outcome(
+        directive_id="D900",
+        directive_title="touch foo",
+        directive_content="change foo.py",
+        status="COMPLETED",
+        files_changed=["src/foo.py"],
+        metric_name="m",
+        metric_before=0.1,
+        metric_after=0.2,
+    )
+    kg.ingest_cycle_outcome(
+        directive_id="D901",
+        directive_title="broke foo",
+        directive_content="still foo.py",
+        status="TEST_FAILED",
+        files_changed=["src/foo.py"],
+        failing_tests=["test_foo"],
+    )
+    ev = Evidence()
+    ev.tests = TestEvidence(failed_names=[], passed=0, failed=0)
+    ev.git_recent_paths = ["src/foo.py"]
+    ctx = kg.build_compact_context(evidence=ev, kg_query_max_directives=4)
+    assert "rel:" in ctx
+    assert "D901" in ctx
+
+
 def test_ingest_stores_layer_and_get_nodes_by_layer(kg: KnowledgeGraph):
     kg.ingest_cycle_outcome(
         directive_id="M001_auto",

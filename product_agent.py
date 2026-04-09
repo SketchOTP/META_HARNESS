@@ -210,21 +210,40 @@ def _build_diagnose_user_prompt(cfg: HarnessConfig, ev: evidence.Evidence, kg: O
             parts.append("")
     if cfg.memory.enabled:
         mem = mem_module.load(cfg.memory_dir)
-        ctx = mem_module.compact_context(mem, kg=kg)
+        ctx = mem_module.compact_context(mem, cfg=cfg, kg=kg, evidence=ev)
         if ctx:
             parts.append(f"## Harness memory\n```\n{ctx}\n```\n")
     parts += [
         "## Evidence",
         f"Collected at: {ev.collected_at}",
     ]
-    if ev.metrics.current:
-        parts.append("\n### Metrics\n```json\n" + json.dumps(ev.metrics.current, indent=2) + "\n```")
-    if ev.test_results.strip():
-        parts.append(f"\n### Tests\n```\n{ev.test_results.strip()[:2500]}\n```")
-    if ev.cycle_history.strip():
-        parts.append(f"\n### Recent cycles\n```\n{ev.cycle_history.strip()}\n```")
-    if ev.file_tree.strip():
-        parts.append(f"\n### File tree (excerpt)\n```\n{ev.file_tree.strip()[:4000]}\n```")
+    sections = evidence.format_evidence_for_diagnosis(cfg, ev)
+    priority = [
+        "Metrics",
+        "Metric anomalies",
+        "Tests",
+        "Error patterns",
+        "Runtime logs",
+        "Last Cursor / Agent CLI failure",
+        "Recent changes",
+        "Previous cycle history",
+        "Project file tree",
+        "AST syntax errors",
+        "Long functions",
+        "Functions (sample)",
+        "Classes (sample)",
+        "Dependencies",
+    ]
+    seen = set()
+    for title in priority:
+        body = sections.get(title)
+        if body and body.strip():
+            parts.append(f"\n### {title}\n```\n{body.strip()}\n```")
+            seen.add(title)
+    for title, body in sections.items():
+        if title in seen or not (body and body.strip()):
+            continue
+        parts.append(f"\n### {title}\n```\n{body.strip()}\n```")
     return "\n".join(parts)
 
 

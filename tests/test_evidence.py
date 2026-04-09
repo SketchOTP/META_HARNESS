@@ -205,6 +205,14 @@ def test_to_prompt_sections_priority():
     assert ti != -1 and li != -1 and ti < li
 
 
+def test_format_evidence_for_diagnosis_compact_metrics(tmp_path: Path):
+    cfg = _cfg(tmp_path)
+    cfg.evidence.metrics_json_compact = True
+    ev = evidence.Evidence(metrics=evidence.MetricsBundle(current={"a": 1.0, "b": 2.0}))
+    sec = evidence.format_evidence_for_diagnosis(cfg, ev)
+    assert sec["Metrics"] == '{"a":1.0,"b":2.0}'
+
+
 def test_reconcile_metrics_when_pytest_collection_fails(tmp_path: Path):
     """Stale metrics.json must not imply a green tree when last_test_output shows collection error."""
     cfg = _cfg(tmp_path)

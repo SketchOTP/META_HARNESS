@@ -28,6 +28,7 @@ from typing import TYPE_CHECKING, Any, Optional
 
 if TYPE_CHECKING:
     from .config import HarnessConfig
+    from .evidence import Evidence
     from .knowledge_graph import KnowledgeGraph
 
 
@@ -163,8 +164,9 @@ def persist_cycle_outcome(
     (via ingest inside update, or ingest-only when memory is disabled).
     """
     graph = kg if kg is not None else get_kg(cfg)
+    mem_out: Optional[ProjectMemory] = None
     if cfg.memory.enabled:
-        return update(
+        mem_out = update(
             cfg.memory_dir,
             cfg.project.name,
             directive_id,
@@ -182,7 +184,7 @@ def persist_cycle_outcome(
             failure_detail=failure_detail,
             layer=layer,
         )
-    if directive_id:
+    elif directive_id:
         err_norm = _normalize_failure_detail(failure_detail) if failure_detail else None
         graph.ingest_cycle_outcome(
             directive_id=directive_id,
@@ -197,7 +199,14 @@ def persist_cycle_outcome(
             failure_detail=err_norm,
             layer=layer,
         )
-    return None
+    if directive_id and status == "COMPLETED" and (directive_content or "").strip():
+        try:
+            from . import embedding_retrieval
+
+            embedding_retrieval.index_directive_body(cfg, directive_id, directive_content)
+        except Exception:
+            pass
+    return mem_out
 
 
 def save(memory_dir: Path, mem: ProjectMemory) -> None:
@@ -322,15 +331,41 @@ def compact_context(
     n_wins: int = 3,
     n_miss: int = 2,
     *,
+    cfg: Optional["HarnessConfig"] = None,
     kg: Optional["KnowledgeGraph"] = None,
+    evidence: Optional["Evidence"] = None,
 ) -> str:
     """
     Render memory as a compact string for injection into Cursor Agent prompts.
     When `kg` is set, prefer the knowledge-graph summary (may include [GRAPH ...]).
     """
+    if cfg is not None:
+        n_wins = cfg.memory.compact_n_wins
+        n_miss = cfg.memory.compact_n_miss
     if kg is not None:
-        gctx = kg.build_compact_context()
+        if cfg is not None:
+            gctx = kg.build_compact_context(
+                max_directives=cfg.memory.kg_max_directives,
+                evidence=evidence,
+                kg_use_query_context=cfg.memory.kg_use_query_context,
+                kg_query_max_chars=cfg.memory.kg_query_max_chars,
+                kg_query_max_directives=cfg.memory.kg_query_max_directives,
+            )
+        else:
+            gctx = kg.build_compact_context()
         if gctx:
+            extra: list[str] = []
+            if cfg is not None and cfg.embedding.enabled and evidence is not None:
+                try:
+                    from . import embedding_retrieval
+
+                    emb_lines = embedding_retrieval.retrieve_compact_lines(cfg, evidence)
+                    if emb_lines:
+                        extra.append("emb: " + " | ".join(emb_lines))
+                except Exception:
+                    pass
+            if extra:
+                return gctx + "\n" + "\n".join(extra)
             return gctx
 
     if mem.total_cycles == 0:
